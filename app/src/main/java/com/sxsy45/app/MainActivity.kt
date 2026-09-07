@@ -211,6 +211,13 @@ class MainActivity : AppCompatActivity() {
         try {
             settings.setGeolocationEnabled(false)
         } catch (e: Exception) { /* 忽略 */ }
+        // 安全加固：关闭本地文件访问，防止网页读取本地文件
+        settings.allowFileAccess = false
+        settings.allowContentAccess = false
+        @Suppress("DEPRECATION")
+        settings.allowFileAccessFromFileURLs = false
+        @Suppress("DEPRECATION")
+        settings.allowUniversalAccessFromFileURLs = false
 
         // JS 桥接：浏览器通道下载（页面内 fetch）分块回传使用
         webView.addJavascriptInterface(DownloadBridge(), "DiscuzApp")
@@ -324,8 +331,20 @@ class MainActivity : AppCompatActivity() {
             override fun onReceivedSslError(
                 view: WebView?, handler: android.webkit.SslErrorHandler?, error: android.net.http.SslError?
             ) {
-                DebugLog.log("SSL", "忽略证书错误: ${error?.url} (${error?.primaryError})")
-                handler?.proceed()
+                // 安全加固：论坛主站域名证书应有效，出现错误必是中间人攻击 → 拒绝；
+                // 非主站域名（中转/资源等）证书过期则放行，保持正常功能
+                val errUrl = error?.url ?: ""
+                val host = try { Uri.parse(errUrl).host?.lowercase() } catch (e: Exception) { null }
+                val isMainHost = host != null && trustedHosts().any { h ->
+                    host == h || host.endsWith(".$h")
+                }
+                if (isMainHost) {
+                    DebugLog.log("SSL", "拒绝主站证书错误: $errUrl")
+                    handler?.cancel()
+                } else {
+                    DebugLog.log("SSL", "放行非主站证书错误: $errUrl")
+                    handler?.proceed()
+                }
             }
 
             /**
@@ -592,6 +611,8 @@ class MainActivity : AppCompatActivity() {
 
   // 1) CSS 强制隐藏 popadv 弹窗 + 遮罩（!important 压过 JS 的 inline style）
   var css='#popadv_popmenu,#popadv_popmask{display:none!important;visibility:hidden!important;opacity:0!important;pointer-events:none!important;}';
+  // 1b) 隐藏帖子正文/回帖里的图片外显（小说论坛正文为文字，图片多为封面/预览/签名图）
+  css+='.t_f img,.t_f a[href*="mod=attachment"] img,td.t_f img,img[id^="aimg_"],img.zoom{display:none!important;}';
   try{
     var s=document.createElement('style');
     s.type='text/css';
@@ -1017,6 +1038,10 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun buyAttachment(url: String?) {
             if (url.isNullOrBlank()) return
+            if (!isTrustedJsUrl(url)) {
+                DebugLog.log("SEC", "拒绝非白名单购买调用: $url")
+                return
+            }
             runOnUiThread { handleAttachPay(url) }
         }
 
@@ -1024,6 +1049,10 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun directDownload(url: String?) {
             if (url.isNullOrBlank()) return
+            if (!isTrustedJsUrl(url)) {
+                DebugLog.log("SEC", "拒绝非白名单下载调用: $url")
+                return
+            }
             runOnUiThread { onDownloadStart(url, null, null) }
         }
 
@@ -1380,6 +1409,15 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) { null }
         if (base.isNullOrBlank()) return emptyList()
         return listOf(base)
+    }
+
+    /** JS 桥调用白名单：相对路径放行（来自论坛页面，后续用论坛 referer 补全）；
+     *  绝对 URL 仅当 host 属于可信论坛域名时放行，拦截恶意页面诱导下载/扣费 */
+    private fun isTrustedJsUrl(url: String): Boolean {
+        if (!url.startsWith("http://") && !url.startsWith("https://")) return true
+        val host = try { Uri.parse(url).host?.lowercase()?.trim() } catch (e: Exception) { null }
+            ?: return false
+        return trustedHosts().any { host == it || host.endsWith(".$it") }
     }
 
     /** URL 是否为「非论坛域名」的外部链接（可能带子域/同域） */

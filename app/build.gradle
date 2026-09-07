@@ -18,8 +18,8 @@ android {
         applicationId "com.sxsy45.app"
         minSdk 21
         targetSdk 34
-        versionCode 8
-        versionName "1.3.3"
+        versionCode 12
+        versionName "1.3.7"
     }
 
     signingConfigs {
@@ -28,6 +28,10 @@ android {
             storePassword keystoreProperties['storePassword']
             keyAlias keystoreProperties['keyAlias']
             keyPassword keystoreProperties['keyPassword']
+            // 签名方案加固：同时启用 v1(JAR) + v2 + v3，最大化兼容性与安全性
+            enableV1Signing = true
+            enableV2Signing = true
+            enableV3Signing = true
         }
     }
 
