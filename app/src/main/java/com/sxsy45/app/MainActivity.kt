@@ -48,9 +48,14 @@ import java.io.ByteArrayInputStream
  * 版面列表「自动加载下一页」的返回还原：
  *  - 站点是把后续页用 JS 追加进当前 DOM，而 Android WebView 的 goBack 一定会重建文档
  *    （WebView 不支持 BFCache），追加内容必然丢失，只剩第一页；
- *  - 因此从「版面列表」点进「帖子」时，帖子改为在新开的独立界面里打开
+ *  - 因此从「版面列表」点进**派生页面**时，一律改在新开的独立界面里打开
  *    （同一 Activity，带 EXTRA_THREAD_MODE），列表界面只被覆盖、不被销毁，
  *    返回时列表已追加的多页内容与滚动位置原封不动，且不引入任何还原脚本（不卡顿）。
+ *  - 派生页面 = 帖子页 + 帖子名旁的分类 tag（filter=typeid）+ 标签页（mod=tag）等；
+ *    版块自身翻页（&page=N）不算，仍在原界面内导航。
+ *  - 堆叠有上限：版面列表 → 列表型派生页（标签/分类/淘帖）→ 帖子，共 3 层。
+ *    从标签列表点进帖子时再开一层，是为了让返回时**标签列表**也不被销毁（否则一样回到第一页）；
+ *    而帖子之间互跳、列表之间互跳仍在同界面内导航，不会无界堆叠。
  *
  * 保留通用辅助：浏览历史、内置 TXT 阅读器入口(在下载管理里打开)、设置(网址/下载目录/历史保留/清数据)、诊断日志。
  * 说明：本版为纯净基础版，不注入任何页面脚本（去广告/自动回复等均未内置）。
@@ -63,8 +68,8 @@ class MainActivity : AppCompatActivity() {
         /** 从「历史记录」页 / 帖子独立界面打开指定网址时，Intent 携带的 URL 键 */
         const val EXTRA_OPEN_URL = "open_url"
         /**
-         * 本实例是否为承载「帖子」的独立界面。
-         * 从版面列表点进帖子时新开一个界面放帖子，列表界面只被覆盖、不被销毁，
+         * 本实例是否为承载「派生页面」的独立界面（帖子 / 分类 tag 筛选 / 标签页）。
+         * 从版面列表点进这些页面时新开一个界面承载，列表界面只被覆盖、不被销毁，
          * 返回时列表已自动加载的多页内容与滚动位置原样还在。
          */
         const val EXTRA_THREAD_MODE = "thread_mode"
@@ -110,9 +115,10 @@ class MainActivity : AppCompatActivity() {
     // （WebView 不支持 BFCache），追加内容必然丢失，只剩第一页；
     // 之前试过「记录高度再滚回去触发站点自动加载」和「body 快照还原」，前者依赖站点机制、
     // 加载不全还卡顿，后者会让页面 JS（翻页/formhash/事件）全部失效。
-    // 现在改为：从「版面列表」点进「帖子」时，让帖子在新的独立界面里打开，
-    // 列表界面只被覆盖、不被销毁 —— 返回时 DOM（含已追加的多页）与滚动位置原封不动。
-    /** 本实例是否为承载「帖子」的独立界面 */
+    // 现在改为：从「版面列表」点进「派生页面」（帖子 / 分类 tag / 标签页）时，
+    // 一律在新的独立界面里打开，列表界面只被覆盖、不被销毁 —— 返回时 DOM
+    // （含已追加的多页）与滚动位置原封不动。（1.3.20 起覆盖到分类 tag 与标签页）
+    /** 本实例是否为承载「派生页面」的独立界面（历史命名 threadMode） */
     private var threadMode = false
     /** 刚从这个界面点开帖子（新开了独立界面）：本次 onResume 不重载首页，保住版面列表 */
     private var returningFromThreadScreen = false
@@ -285,8 +291,8 @@ class MainActivity : AppCompatActivity() {
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                 val url = request?.url?.toString() ?: return false
                 DebugLog.log("NAV", url)
-                // 版面列表 → 帖子：新开独立界面承载帖子，让列表留在后台（返回即原样恢复）
-                if (openThreadInNewScreen(url)) return true
+                // 版面列表 → 帖子/分类标签/标签页：新开独立界面承载，让列表留在后台（返回即原样恢复）
+                if (openDerivedPageInNewScreen(url)) return true
                 // 畸形登录 URL 自愈：拦下死循环地址，改载干净登录页
                 selfHealLoginUrl(url)?.let { healed ->
                     webView.loadUrl(healed)
@@ -310,8 +316,8 @@ class MainActivity : AppCompatActivity() {
             override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
                 if (url != null) {
                     DebugLog.log("NAV", url)
-                    // 版面列表 → 帖子：新开独立界面承载帖子，让列表留在后台（返回即原样恢复）
-                    if (openThreadInNewScreen(url)) return true
+                    // 版面列表 → 帖子/分类标签/标签页：新开独立界面承载，让列表留在后台（返回即原样恢复）
+                    if (openDerivedPageInNewScreen(url)) return true
                     selfHealLoginUrl(url)?.let { healed ->
                         webView.loadUrl(healed)
                         return true
@@ -950,7 +956,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ---------------------------------------------------------------- 帖子独立界面
+    // ---------------------------------------------------------------- 派生页面独立界面
 
     /**
      * 目标地址是否是「帖子」页：
@@ -966,32 +972,83 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 版面列表 → 帖子：不在本界面内导航，而是新开一个独立界面承载帖子。
+     * 是否是「派生页面」——从版面列表点进去，会另开一个列表/详情内容的页面。
+     *
+     * 除了帖子本身，还有两类同样会把列表文档顶掉（返回后只剩第一页）：
+     *  - 主题分类筛选：挂在帖子名旁边的分类 tag（如 [纯爱]）
+     *    → forum.php?mod=forumdisplay&fid=x&filter=typeid&typeid=y
+     *  - 标签页：帖子里的 tag → misc.php?mod=tag&id=x
+     * 它们本质上是「另一个列表」，在同一个 WebView 里加载 = 版面列表被销毁；
+     * 而 Android WebView 不支持 BFCache，goBack 必然重建文档，站点 JS 追加的后续页必丢。
+     *
+     * 注意：版块自身的翻页（forum.php?mod=forumdisplay&fid=x&page=2）**不属于**派生页面 ——
+     * 那是列表自己换页，必须留在原界面内导航，否则点「下一页」会堆出一摞界面。
+     */
+    private fun isDerivedPageUrl(url: String?): Boolean =
+        isThreadUrl(url) || isDerivedListUrl(url)
+
+    /**
+     * 派生页面里「列表型」的那几种：标签页 / 主题分类筛选 / 淘帖专辑。
+     *
+     * 它们和版面列表一样会自动加载后续页（站点 JS 往 DOM 里追加），同样不能在别的界面里被顶掉，
+     * 否则返回时必回第一页。区分开来是为了控制界面堆叠深度，见 openDerivedPageInNewScreen。
+     */
+    private fun isDerivedListUrl(url: String?): Boolean {
+        if (url.isNullOrBlank()) return false
+        if (isThreadUrl(url)) return false
+        val l = url.lowercase()
+        if (!l.startsWith("http")) return false
+        // 标签页 / 标签聚合页
+        if (l.contains("mod=tag")) return true
+        if (Regex("/tag-\\d+").containsMatchIn(l)) return true
+        // 主题分类 / 分类信息 / 精华 等筛选出来的「另一个列表」
+        if (l.contains("mod=forumdisplay") &&
+            (l.contains("filter=typeid") || l.contains("filter=sortid") || l.contains("filter=digest"))
+        ) return true
+        // 淘帖 / 专辑
+        if (l.contains("mod=collection")) return true
+        return false
+    }
+
+    /**
+     * 版面列表 → 帖子 / 分类标签 / 标签页：不在本界面内导航，而是新开一个独立界面承载它。
      *
      * 这样本界面（版面列表）只被覆盖、不被销毁：站点 JS 已经追加进 DOM 的后续页、
      * 以及滚动位置都原样保留，返回时立刻就是离开前的样子 —— 不依赖任何还原脚本，
      * 也就不会出现「只加载几页」或卡顿。
      *
-     * 只在「当前不在帖子页」时新开：已经身处帖子界面时，帖子内的跳转（相关帖、上下帖、
-     * 版面链接等）仍在本界面内导航，避免界面无限堆叠。
+     * 只在「当前不在派生页面」（或当前是列表型派生页而目标是帖子）时新开，
+     * 其余情况仍在本界面内导航，避免界面无界堆叠 —— 详见函数内注释。
      * 已新开界面并需要拦截本次导航时返回 true。
+     *
+     * 命名说明：EXTRA_THREAD_MODE / threadMode / returningFromThreadScreen 是 1.3.19 的
+     * 历史命名（当时只用于帖子页），1.3.20 起覆盖全部派生页面（帖子 / 分类筛选 / 标签）。
      */
-    private fun openThreadInNewScreen(url: String): Boolean {
-        if (threadMode) return false                       // 本身就是帖子界面
-        if (!isThreadUrl(url)) return false                // 只对帖子页生效
-        if (isThreadUrl(lastContentPageUrl)) return false  // 当前已在帖子页 → 本界面内跳转
-        DebugLog.log("NAV", "帖子新开独立界面（版面列表留在后台）: $url")
+    private fun openDerivedPageInNewScreen(url: String): Boolean {
+        if (threadMode) return false                            // 本身就是独立界面
+        if (!isDerivedPageUrl(url)) return false                // 只对派生页面生效
+        // 当前已在派生页面时的取舍（既要避免界面无界堆叠，又要保住「列表型」页面）：
+        //  - 当前是「帖子」→ 一律本界面内导航（帖子之间互跳是常态，逐个开新界面会堆一摞 WebView）
+        //  - 当前是「标签 / 分类筛选 / 淘帖等列表」且目标是帖子 → 再开一层。
+        //    这样 版面列表 → 标签列表 → 帖子 这条链路里，返回时标签列表
+        //    （站点 JS 已追加的后续页 + 滚动位置）原样还在，而不是重建回第一页。
+        //  - 其余（列表 → 列表等）→ 保持本界面内导航。
+        // 堆叠深度因此有上限：版面列表 → 列表型派生页 → 帖子，共 3 层，不会无界增长。
+        if (isDerivedPageUrl(lastContentPageUrl) &&
+            !(isDerivedListUrl(lastContentPageUrl) && isThreadUrl(url))
+        ) return false
+        DebugLog.log("NAV", "派生页面新开独立界面（版面列表留在后台）: $url")
         return try {
             startActivity(
                 Intent(this, MainActivity::class.java)
                     .putExtra(EXTRA_OPEN_URL, url)
                     .putExtra(EXTRA_THREAD_MODE, true)
             )
-            // 帖子界面盖上来，本界面稍后会 onResume：标记住，别把版面列表重载成首页
+            // 独立界面盖上来，本界面稍后会 onResume：标记住，别把版面列表重载成首页
             returningFromThreadScreen = true
             true
         } catch (e: Exception) {
-            DebugLog.log("NAV", "新开帖子界面失败，改为本界面内导航: ${e.message}")
+            DebugLog.log("NAV", "新开独立界面失败，改为本界面内导航: ${e.message}")
             false
         }
     }
@@ -1421,8 +1478,8 @@ class MainActivity : AppCompatActivity() {
             startDirectAttachment(url)
             return
         }
-        // 版面列表 → 帖子（window.open / target=_blank 形式）：同样新开独立界面承载
-        if (openThreadInNewScreen(url)) return
+        // 版面列表 → 帖子/分类标签/标签页（window.open / target=_blank 形式）：同样新开独立界面承载
+        if (openDerivedPageInNewScreen(url)) return
         // 畸形登录 URL 自愈：弹窗带出死循环地址时先归正
         selfHealLoginUrl(url)?.let {
             webView.loadUrl(it)
