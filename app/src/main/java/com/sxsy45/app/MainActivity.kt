@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Message
+import android.util.Log
 import android.view.Menu
 import android.view.MenuItem
 import android.view.View
@@ -44,6 +45,13 @@ import java.io.ByteArrayInputStream
  *    取文件，分块经 JS 桥回传保存。
  *  - 文件名：去站点标记（如 [sxsy.org] 前缀），乱码修复，按魔数补扩展名，同名自动加序号。
  *
+ * 版面列表「自动加载下一页」的返回还原：
+ *  - 站点是把后续页用 JS 追加进当前 DOM，而 Android WebView 的 goBack 一定会重建文档
+ *    （WebView 不支持 BFCache），追加内容必然丢失，只剩第一页；
+ *  - 因此从「版面列表」点进「帖子」时，帖子改为在新开的独立界面里打开
+ *    （同一 Activity，带 EXTRA_THREAD_MODE），列表界面只被覆盖、不被销毁，
+ *    返回时列表已追加的多页内容与滚动位置原封不动，且不引入任何还原脚本（不卡顿）。
+ *
  * 保留通用辅助：浏览历史、内置 TXT 阅读器入口(在下载管理里打开)、设置(网址/下载目录/历史保留/清数据)、诊断日志。
  * 说明：本版为纯净基础版，不注入任何页面脚本（去广告/自动回复等均未内置）。
  */
@@ -52,8 +60,14 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val REQ_STORAGE = 100
         private const val REQ_SETUP = 101
-        /** 从「历史记录」页打开指定网址时，Intent 携带的 URL 键 */
+        /** 从「历史记录」页 / 帖子独立界面打开指定网址时，Intent 携带的 URL 键 */
         const val EXTRA_OPEN_URL = "open_url"
+        /**
+         * 本实例是否为承载「帖子」的独立界面。
+         * 从版面列表点进帖子时新开一个界面放帖子，列表界面只被覆盖、不被销毁，
+         * 返回时列表已自动加载的多页内容与滚动位置原样还在。
+         */
+        const val EXTRA_THREAD_MODE = "thread_mode"
     }
 
     /** 适配高刷新率屏幕：在同分辨率模式中选刷新率最高的（API 23+） */
@@ -91,6 +105,18 @@ class MainActivity : AppCompatActivity() {
     // 登录回跳死循环(ERR_TOO_MANY_REDIRECTS)的自动恢复标记：单次导航只自动恢复一次，避免自身再循环
     private var redirectLoopRetried = false
 
+    // 版面列表「自动加载下一页」的返回还原（1.3.19 起改为结构化方案）：
+    // 站点是把后续页用 JS 追加进当前 DOM，而 Android WebView 的 goBack 一定会重建文档
+    // （WebView 不支持 BFCache），追加内容必然丢失，只剩第一页；
+    // 之前试过「记录高度再滚回去触发站点自动加载」和「body 快照还原」，前者依赖站点机制、
+    // 加载不全还卡顿，后者会让页面 JS（翻页/formhash/事件）全部失效。
+    // 现在改为：从「版面列表」点进「帖子」时，让帖子在新的独立界面里打开，
+    // 列表界面只被覆盖、不被销毁 —— 返回时 DOM（含已追加的多页）与滚动位置原封不动。
+    /** 本实例是否为承载「帖子」的独立界面 */
+    private var threadMode = false
+    /** 刚从这个界面点开帖子（新开了独立界面）：本次 onResume 不重载首页，保住版面列表 */
+    private var returningFromThreadScreen = false
+
     // WebView 只能在主线程访问，而 shouldInterceptRequest 在后台线程运行：
     // 预先在主线程缓存 UA 与最近的内容页地址（作下载 Referer），供后台拦截线程读取
     @Volatile private var cachedUserAgent: String = ""
@@ -103,6 +129,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        threadMode = intent?.getBooleanExtra(EXTRA_THREAD_MODE, false) ?: false
         applyHighRefreshRate()
         Prefs.setDesktopMode(this, true)
         Prefs.setAdBlock(this, true)
@@ -111,13 +138,19 @@ class MainActivity : AppCompatActivity() {
 
         toolbar = findViewById(R.id.toolbar)
         setSupportActionBar(toolbar)
+        // 帖子独立界面：标题栏给一个返回箭头，点它等价于系统返回键（回到版面列表）
+        if (threadMode) {
+            supportActionBar?.setDisplayHomeAsUpEnabled(true)
+            supportActionBar?.setDisplayShowHomeEnabled(true)
+        }
 
         webView = findViewById(R.id.webView)
         swipeRefresh = findViewById(R.id.swipeRefresh)
         progressBar = findViewById(R.id.progressBar)
 
         setupWebView()
-        warmUpWebView()
+        // 帖子界面不预热：此时已经有一个 WebView 在跑，避免多创建一次内核
+        if (!threadMode) warmUpWebView()
 
         // 从「历史记录」页带 URL 启动：直接打开该网址
         val openUrl = intent?.getStringExtra(EXTRA_OPEN_URL)
@@ -157,8 +190,11 @@ class MainActivity : AppCompatActivity() {
         lastDesktopMode = desktop
         webView.settings.userAgentString = buildUserAgent()
         cachedUserAgent = webView.settings.userAgentString
-        if (openedFromHistory) {
+        // 从历史记录打开、本实例是帖子独立界面、或刚点开帖子又返回本界面：
+        // 都不要用「配置的首页」把当前页覆盖掉，否则版面列表会被清掉
+        if (openedFromHistory || threadMode || returningFromThreadScreen) {
             openedFromHistory = false
+            returningFromThreadScreen = false
             return
         }
         val target = url.ifBlank { Prefs.DEFAULT_FORUM_URL }
@@ -249,6 +285,8 @@ class MainActivity : AppCompatActivity() {
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                 val url = request?.url?.toString() ?: return false
                 DebugLog.log("NAV", url)
+                // 版面列表 → 帖子：新开独立界面承载帖子，让列表留在后台（返回即原样恢复）
+                if (openThreadInNewScreen(url)) return true
                 // 畸形登录 URL 自愈：拦下死循环地址，改载干净登录页
                 selfHealLoginUrl(url)?.let { healed ->
                     webView.loadUrl(healed)
@@ -272,6 +310,8 @@ class MainActivity : AppCompatActivity() {
             override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
                 if (url != null) {
                     DebugLog.log("NAV", url)
+                    // 版面列表 → 帖子：新开独立界面承载帖子，让列表留在后台（返回即原样恢复）
+                    if (openThreadInNewScreen(url)) return true
                     selfHealLoginUrl(url)?.let { healed ->
                         webView.loadUrl(healed)
                         return true
@@ -910,6 +950,52 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ---------------------------------------------------------------- 帖子独立界面
+
+    /**
+     * 目标地址是否是「帖子」页：
+     * Discuz 三种形态 —— forum.php?mod=viewthread&tid=xx / thread-xx-1-1.html / viewthread.php?tid=xx
+     */
+    private fun isThreadUrl(url: String?): Boolean {
+        if (url.isNullOrBlank()) return false
+        val l = url.lowercase()
+        if (!l.startsWith("http")) return false
+        if (l.contains("mod=viewthread")) return true
+        if (l.contains("viewthread.php")) return true
+        return Regex("/thread-\\d+(-[\\d-]+)*\\.html").containsMatchIn(l)
+    }
+
+    /**
+     * 版面列表 → 帖子：不在本界面内导航，而是新开一个独立界面承载帖子。
+     *
+     * 这样本界面（版面列表）只被覆盖、不被销毁：站点 JS 已经追加进 DOM 的后续页、
+     * 以及滚动位置都原样保留，返回时立刻就是离开前的样子 —— 不依赖任何还原脚本，
+     * 也就不会出现「只加载几页」或卡顿。
+     *
+     * 只在「当前不在帖子页」时新开：已经身处帖子界面时，帖子内的跳转（相关帖、上下帖、
+     * 版面链接等）仍在本界面内导航，避免界面无限堆叠。
+     * 已新开界面并需要拦截本次导航时返回 true。
+     */
+    private fun openThreadInNewScreen(url: String): Boolean {
+        if (threadMode) return false                       // 本身就是帖子界面
+        if (!isThreadUrl(url)) return false                // 只对帖子页生效
+        if (isThreadUrl(lastContentPageUrl)) return false  // 当前已在帖子页 → 本界面内跳转
+        DebugLog.log("NAV", "帖子新开独立界面（版面列表留在后台）: $url")
+        return try {
+            startActivity(
+                Intent(this, MainActivity::class.java)
+                    .putExtra(EXTRA_OPEN_URL, url)
+                    .putExtra(EXTRA_THREAD_MODE, true)
+            )
+            // 帖子界面盖上来，本界面稍后会 onResume：标记住，别把版面列表重载成首页
+            returningFromThreadScreen = true
+            true
+        } catch (e: Exception) {
+            DebugLog.log("NAV", "新开帖子界面失败，改为本界面内导航: ${e.message}")
+            false
+        }
+    }
+
     /** 预热 WebView 内核，让冷启动后首次浏览更快 */
     private fun warmUpWebView() {
         webView.postDelayed({
@@ -1335,6 +1421,8 @@ class MainActivity : AppCompatActivity() {
             startDirectAttachment(url)
             return
         }
+        // 版面列表 → 帖子（window.open / target=_blank 形式）：同样新开独立界面承载
+        if (openThreadInNewScreen(url)) return
         // 畸形登录 URL 自愈：弹窗带出死循环地址时先归正
         selfHealLoginUrl(url)?.let {
             webView.loadUrl(it)
@@ -1510,6 +1598,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onOptionsItemSelected(item: MenuItem): Boolean {
         return when (item.itemId) {
+            // 帖子独立界面标题栏的返回箭头 = 系统返回键
+            android.R.id.home -> { onBackPressed(); true }
             R.id.action_stop -> { webView.stopLoading(); true }
             R.id.action_refresh -> {
                 webView.clearCache(true)
@@ -1538,7 +1628,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onBackPressed() {
-        if (webView.canGoBack()) {
+        // 帖子独立界面：只在入口那一页之上还有历史时才后退；退到入口就不再退了，
+        // 直接关掉本界面回到版面列表（避免登录回跳等自身重定向把用户困在两层之间）。
+        val atEntry = threadMode && (webView.copyBackForwardList()?.currentIndex ?: 0) <= 1
+        if (webView.canGoBack() && !atEntry) {
             webView.goBack()
         } else {
             super.onBackPressed()
