@@ -46,21 +46,15 @@ object DownloadHelper {
     fun start(
         ctx: Context, userAgent: String, url: String,
         contentDisposition: String?, referer: String?,
-        fallbackName: String? = null,
         onHtmlFallback: ((String) -> Unit)? = null
     ) {
         val appCtx = ctx.applicationContext
         thread {
             try {
-                // 书名（帖子标题）优先：书名可靠且完整，直接作为文件名，不做响应头乱码检测
-                val presetName = if (!fallbackName.isNullOrBlank()) {
-                    fallbackName
-                } else if (!contentDisposition.isNullOrBlank()) {
-                    resolveFileName(url, contentDisposition)
-                } else {
-                    resolveFileName(url, null)
-                }
-                val finalName = download(appCtx, userAgent, url, presetName, referer, fallbackName, onHtmlFallback)
+                // 文件名取自下载文件本身：响应头 Content-Disposition → URL 最后一段兜底
+                // （不再用帖子标题改写文件名）
+                val presetName = resolveFileName(url, contentDisposition)
+                val finalName = download(appCtx, userAgent, url, presetName, referer, onHtmlFallback)
                 if (finalName != null) {
                     mainHandler.post {
                         Toast.makeText(appCtx, "下载完成：$finalName\n保存于 Download/${Prefs.getDownloadDir(appCtx)}", Toast.LENGTH_LONG).show()
@@ -88,43 +82,111 @@ object DownloadHelper {
                     name = decodeFilenameCandidates(raw).firstOrNull()
                 }
             // 2. Content-Disposition 中的普通 filename=
+            //    Discuz(PHP) 中文附件名常用 MIME encoded-word 包裹：filename="=?UTF-8?B?5Lmm5ZCN.txt?="
+            //    必须先还原 encoded-word，否则会被当成一串无意义字符
             if (name.isNullOrBlank()) {
                 Regex("filename\\s*=\\s*\"?([^\";]+)\"?", RegexOption.IGNORE_CASE)
                     .find(contentDisposition)?.let {
-                        val raw = it.groupValues[1].trim()
+                        val raw = decodeMimeWord(it.groupValues[1].trim())
                         name = decodeFilenameCandidates(raw).firstOrNull()
                     }
             }
         }
 
-        // 3. URL 最后一段兜底
-        if (name.isNullOrBlank() || !name!!.contains('.')) {
+        // 3. URL 最后一段兜底：但 Discuz 附件链接形如 forum.php?mod=attachment&aid=xxx，
+        //    其最后一段是 forum.php —— 脚本页绝不是文件名，必须排除
+        if (name.isNullOrBlank() || !name!!.contains('.') || looksLikeScriptOrGenericPage(name)) {
             val seg = Uri_parseLastSegment(url)
-            if (seg != null && seg.contains('.')) {
+            if (seg != null && seg.contains('.') && !looksLikeScriptOrGenericPage(seg)) {
                 val segName = try {
                     fixEncoding(URLDecoder.decode(seg, "UTF-8"))
                 } catch (e: Exception) { fixEncoding(seg) }
-                name = segName
+                if (!looksLikeScriptOrGenericPage(segName)) name = segName
             }
         }
 
         // 4. 最终兜底名
-        if (name.isNullOrBlank()) {
+        if (name.isNullOrBlank() || looksLikeScriptOrGenericPage(name)) {
             name = "download_" + System.currentTimeMillis()
         }
 
         var result = fixEncoding(name!!)
         result = stripWebsite(result)
-        
+
         // 清理文件名非法字符与无效乱码
-        result = result.replace(Regex("[\\\\/:*?\"<>|\\uFFFD]"), "_") 
-        
+        result = result.replace(Regex("[\\\\/:*?\"<>|\\uFFFD]"), "_")
+
         return result
     }
 
     private fun Uri_parseLastSegment(url: String): String? = try {
         android.net.Uri.parse(url).lastPathSegment
     } catch (e: Exception) { null }
+
+    /** 脚本/网页类扩展名：Discuz 附件链接的最后一段常是这些，绝不能当文件名 */
+    private val SCRIPT_EXTENSIONS = setOf(
+        ".php", ".php3", ".php4", ".php5", ".phtml", ".phps", ".asp", ".aspx", ".ashx",
+        ".jsp", ".jspx", ".do", ".action", ".cgi", ".pl", ".shtml", ".html", ".htm", ".xhtml"
+    )
+
+    /** Discuz 附件下载端点的通用无意义主体名 */
+    private val GENERIC_FILE_BASES = setOf(
+        "attachment", "forum", "file", "index", "member", "home", "misc",
+        "viewthread", "plugin", "download", "ajax", "api", "search"
+    )
+
+    /** 判断解析出的名字是不是「脚本页/通用端点名」而非真实文件名 */
+    private fun looksLikeScriptOrGenericPage(name: String?): Boolean {
+        if (name.isNullOrBlank()) return true
+        val i = name.lastIndexOf('.')
+        if (i <= 0) return false
+        val ext = name.substring(i).lowercase()
+        if (ext in SCRIPT_EXTENSIONS) return true
+        val base = name.substring(0, i).lowercase()
+        return base in GENERIC_FILE_BASES
+    }
+
+    /**
+     * 还原 MIME encoded-word：`=?UTF-8?B?<base64>?=` 或 `=?GBK?Q?<quoted>?=`。
+     * Discuz(PHP) 给中文文件名时会用这种格式，解析失败原样返回。
+     */
+    private fun decodeMimeWord(value: String): String {
+        val t = value.trim().trim('"')
+        val m = Regex("=\\?([^?]+)\\?([BbQq])\\?([^?]*)\\?=").find(t) ?: return t
+        return try {
+            val cs = charsetOf(m.groupValues[1])
+            val mode = m.groupValues[2].uppercase()
+            val payload = m.groupValues[3]
+            val bytes = if (mode == "B") {
+                android.util.Base64.decode(payload, android.util.Base64.DEFAULT)
+            } else {
+                decodeQuotedPrintable(payload)
+            }
+            String(bytes, cs)
+        } catch (e: Exception) { t }
+    }
+
+    private fun charsetOf(name: String): java.nio.charset.Charset = try {
+        java.nio.charset.Charset.forName(name.trim())
+    } catch (e: Exception) { Charsets.UTF_8 }
+
+    /** Q 编码：`_` 表示空格，`=XX` 是十六进制字节，其余按 latin-1 单字节 */
+    private fun decodeQuotedPrintable(s: String): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        var i = 0
+        while (i < s.length) {
+            val c = s[i]
+            when {
+                c == '_' -> { out.write(' '.code); i++ }
+                c == '=' && i + 2 < s.length -> {
+                    val hex = s.substring(i + 1, i + 3)
+                    out.write(hex.toInt(16)); i += 3
+                }
+                else -> { out.write(c.toString().toByteArray(Charsets.ISO_8859_1)); i++ }
+            }
+        }
+        return out.toByteArray()
+    }
 
     /**
      * 乱码修复：文件名可能经历 URL 编码、ISO-8859-1 误解码或 GBK/UTF-8 混用，
@@ -572,7 +634,6 @@ object DownloadHelper {
     private fun download(
         ctx: Context, userAgent: String, url: String,
         presetName: String, referer: String?,
-        bookName: String?,
         onHtmlFallback: ((String) -> Unit)?
     ): String? {
         var currentUrl = url
@@ -633,9 +694,8 @@ object DownloadHelper {
                 throw IOException("返回的是网页而非文件（$currentUrl）\n请确认已在论坛登录，附件权限足够")
             }
 
-            // 书名优先：书名非空时直接用书名（已在 presetName 里），不再解析响应头 filename 做乱码检测。
-            // 仅当没有书名时，才解析响应头 filename 并用 isGarbledName 过滤乱码。
-            if (respCd != null && bookName.isNullOrBlank()) {
+            // 文件名始终取自下载文件本身：每跳都用最新响应头 filename 刷新，URL 兜底已在 presetName 里。
+            if (respCd != null) {
                 try {
                     val re = resolveFileName(currentUrl, respCd)
                     if (isGarbledName(re)) {
@@ -646,12 +706,6 @@ object DownloadHelper {
                         DebugLog.log("DL", "文件名解析正常: $re")
                     }
                 } catch (e: Exception) { DebugLog.log("DL", "文件名解析异常: ${e.message}") }
-            }
-
-            // 最终确认：书名非空则一律用书名作为文件名（帖子标题最可靠）
-            if (!bookName.isNullOrBlank()) {
-                name = bookName
-                DebugLog.log("DL", "使用书名作为文件名: $name")
             }
 
             // 下载内容先限额读入临时文件，避免大 TXT 形成整文件内存副本。
@@ -757,13 +811,6 @@ object DownloadHelper {
         return underscore >= 3 && meaningful <= 2
     }
 
-    /** 解析文件名：书名（帖子标题）非空时直接用它，否则解析响应头/URL */
-    fun resolveWithBookName(url: String, contentDisposition: String?, bookName: String?): String {
-        // 书名优先：帖子标题可靠且完整，直接作为文件名，不再做响应头乱码检测
-        if (!bookName.isNullOrBlank()) return bookName
-        return resolveFileName(url, contentDisposition)
-    }
-
     private fun isZipData(data: ByteArray): Boolean {
         return data.size >= 4 &&
             data[0] == 0x50.toByte() &&
@@ -848,13 +895,15 @@ object DownloadHelper {
     }
 
     private fun normalizeSavedFileName(fileName: String, fileType: FileType): String {
-        // 书名兜底/正常中文文件名：已是正确中文，跳过 fixEncoding 的多编码猜测（避免把正常书名再"解码"坏）。
-        // 仅当文件名疑似乱码（无中文或含乱码特征）时才走 fixEncoding 尝试还原。
-        val hasHanzi = fileName.any { it in '\u4e00'..'\u9fff' }
-        val alreadyClean = hasHanzi && !looksMojibake(fileName) && !looksChineseMojibake(fileName)
-        val safe = (if (alreadyClean) fileName else fixEncoding(fileName))
+        // 不做乱码修复/重命名：站点返回的文件名本身不乱码。
+        // 只做两件事：清理非法字符、去掉文件名前面的站点标记。
+        // 注意 stripWebsite 必须在「含扩展名的完整名」上调用——它靠最后一个点拆 base/ext，
+        // 若先拆掉扩展名再传进去，站点域名里的点会被当成扩展名分隔点，前缀就剥不掉了。
+        var safe = fileName
             .replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001F\\uFFFD]"), "_")
             .trim()
+        val stripped = stripWebsite(safe)
+        if (stripped.isNotBlank()) safe = stripped.trim()
 
         // 保留原始扩展名（.epub/.pdf/.txt/.zip/.rar 等），仅当无合理扩展名时才用魔数识别的真实扩展名兜底
         val knownExts = setOf(
@@ -881,35 +930,7 @@ object DownloadHelper {
         if (baseName.isBlank()) {
             return "download_" + System.currentTimeMillis() + ext
         }
-        val readable = if (looksMojibake(baseName) || looksChineseMojibake(baseName)) {
-            "download_" + System.currentTimeMillis()
-        } else {
-            cleanName(baseName)
-        }
-        return readable + ext
-    }
-
-    /** 清理书名的后缀修饰语和符号（如"斗破苍穹最终修改版》=====..." → "斗破苍穹"）。 */
-    private fun cleanName(name: String): String {
-        var r = name.trim()
-        // 0. 去掉站点前置标记（如 [sxsy.org]、[www.sxsy.org]、sxsy.org 前缀），再正常收尾
-        val stripped = stripWebsite(r)
-        if (stripped.isNotBlank() && !stripped.equals(r, ignoreCase = true)) r = stripped.trim()
-        // 1. 去掉末尾连续符号（非中文、非字母数字）
-        r = r.trimEnd { ch -> !ch.isLetterOrDigit() && ch !in '\u4e00'..'\u9fff' }
-        // 2. 去掉末尾的修饰后缀（常见小说文件名后缀，仅当去掉后仍剩有效书名）
-        val suffixes = listOf(
-            "最终修改版", "修改版", "精校版", "校对版", "精修版", "完整版",
-            "无删减", "未删减", "全本", "完结", "完本", "全文", "校对全本", "全本无删减"
-        )
-        for (s in suffixes) {
-            if (r.endsWith(s) && r.length > s.length) {
-                r = r.dropLast(s.length)
-                r = r.trimEnd { ch -> !ch.isLetterOrDigit() && ch !in '\u4e00'..'\u9fff' }
-                break
-            }
-        }
-        return r.trim().ifBlank { name }
+        return baseName + ext
     }
 
     private fun findTitleInHtml(body: ByteArray): String? {

@@ -127,8 +127,6 @@ class MainActivity : AppCompatActivity() {
     // 预先在主线程缓存 UA 与最近的内容页地址（作下载 Referer），供后台拦截线程读取
     @Volatile private var cachedUserAgent: String = ""
     @Volatile private var lastContentPageUrl: String? = null
-    // 当前页面「书名」（CSS 提取 #thread_subject），供下载命名
-    @Volatile private var cachedBookName: String? = null
     // 购买成功后待下载的附件 aid：刷新帖子页后据此找已生效的下载链接
     @Volatile private var pendingDownloadAid: String? = null
     private val popupWindows = mutableListOf<WebView>()
@@ -187,6 +185,10 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        // 恢复本 WebView 的 JS 定时器与渲染（与 onPause 配对）。
+        // 必须在所有提前 return 之前调用：否则从帖子界面返回版面列表时，
+        // 因 returningFromThreadScreen 提前 return，本 WebView 会一直停留在暂停态而卡死。
+        try { webView.onResume() } catch (_: Exception) {}
         // 等待首次设置期间：不自动加载，等 onActivityResult 清除标记后由本方法加载
         if (awaitingSetup) return
         // 从设置页返回后：网址 / 电脑版开关可能已改变，按需重新加载
@@ -224,8 +226,20 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        // 清掉本界面的 WebView 定时器，避免被销毁后仍残留执行
+        try { webView.stopLoading() } catch (_: Exception) {}
         popupWindows.forEach { try { it.destroy() } catch (_: Exception) {} }
         popupWindows.clear()
+    }
+
+    override fun onPause() {
+        // 暂停本 WebView 的 JS 定时器与渲染：点开帖子会新开一个界面承载帖子页，
+        // 本界面（版面列表）转入后台。若不暂停，它注入的广告监听/自动购买轮询/自动签到
+        // 会继续在后台跑，与新界面的 WebView 抢主线程和 CPU —— 这是「打开帖子慢」的主因之一。
+        // 注意：这里只用实例方法 onPause()，不能用进程级的 WebView.pauseTimers()——
+        // 后者会把刚新开的帖子页 WebView 的定时器一起冻结。
+        try { webView.onPause() } catch (_: Exception) {}
+        super.onPause()
     }
 
     @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
@@ -282,7 +296,6 @@ class MainActivity : AppCompatActivity() {
                 tryAutoPay()
                 updateTitle()
                 recordHistory(view, url)
-                extractBookName()
                 // 购买成功后刷新了帖子页：自动找该 aid 已生效的下载链接并下载
                 tryAutoDownloadAfterBuy()
                 DebugLog.log("PAGE", "加载完成: $url | title=${view?.title}")
@@ -429,11 +442,10 @@ class MainActivity : AppCompatActivity() {
                         DebugLog.log("INTERCEPT", "重复请求，跳过: $url")
                         null
                     } else {
-                        val bn = currentBookName()
-                        val name = DownloadHelper.resolveWithBookName(p.finalUrl, p.disposition, bn)
+                        val name = DownloadHelper.resolveFileName(p.finalUrl, p.disposition)
                         val savedName = DownloadHelper.saveFromFile(this@MainActivity, p.file, name)
                         p.file.delete()
-                        DebugLog.log("INTERCEPT", "已保存: $savedName (${p.size}B) | 书名=$bn")
+                        DebugLog.log("INTERCEPT", "已保存: $savedName (${p.size}B)")
                         runOnUiThread {
                             Toast.makeText(
                                 this@MainActivity,
@@ -683,15 +695,31 @@ class MainActivity : AppCompatActivity() {
     removeNode('popadv_popmask');
   }
   kill();
+  // 去抖：MutationObserver 回调在页面加载期会被触发成千上万次，若每次都跑全文档
+  // getElementById 尚可，但下面的 killFwinAll 是 querySelectorAll 全文档扫描，逐次执行会把
+  // 主线程 JS 拖死（这正是「进软件慢 / 打开帖子慢」的主因）。改为：变动只置脏标记，
+  // 由 250ms 定时器合并处理；并在页面稳定 10 秒后自动断开两个观察器，彻底停止开销。
+  var popadvDirty=false;
+  var mo=null;
   try{
-    var mo=new MutationObserver(function(){
-      var p=document.getElementById('popadv_popmenu');
-      if(p && p.style && p.style.display!=='none') p.style.display='none';
-      var m=document.getElementById('popadv_popmask');
-      if(m && m.style && m.style.display!=='none') m.style.display='none';
-    });
+    mo=new MutationObserver(function(){ popadvDirty=true; });
     mo.observe(document.documentElement||document.body,{childList:true,subtree:true});
   }catch(e){}
+
+  if(!window.__sxsyFwinTimer){
+    window.__sxsyFwinTimer=setInterval(function(){
+      if(popadvDirty){
+        popadvDirty=false;
+        try{
+          var p=document.getElementById('popadv_popmenu');
+          if(p && p.style && p.style.display!=='none') p.style.display='none';
+          var m=document.getElementById('popadv_popmask');
+          if(m && m.style && m.style.display!=='none') m.style.display='none';
+        }catch(e){}
+      }
+      try{ killFwinAll(); }catch(e){}
+    },250);
+  }
 
   // ---- Discuz 系统 fwin_ 广告浮层兜底（不碰功能浮层）----
   var AD=/(下载|立即下载|douyin|抖音|app\b|推广|download|广告|ad\b)/i;
@@ -707,13 +735,17 @@ class MainActivity : AppCompatActivity() {
     if(cover) cover.style.display='none';
   }
   function killFwinAll(){
-    document.querySelectorAll('[id^="fwin_"]').forEach(killFwin);
+    var els=document.querySelectorAll('[id^="fwin_"]');
+    for(var i=0;i<els.length;i++) killFwin(els[i]);
   }
   killFwinAll();
-  try{
-    var mo2=new MutationObserver(killFwinAll);
-    mo2.observe(document.documentElement||document.body,{childList:true,subtree:true});
-  }catch(e){}
+
+  // 页面稳定 10 秒后停止：断开观察器并清掉合并定时器（弹窗广告只会在加载初期出现）
+  setTimeout(function(){
+    try{ if(mo){ mo.disconnect(); mo=null; } }catch(e){}
+    try{ killFwinAll(); }catch(e){}
+    try{ if(window.__sxsyFwinTimer){ clearInterval(window.__sxsyFwinTimer); window.__sxsyFwinTimer=null; } }catch(e){}
+  },10000);
 })();
 """.trimIndent()
         webView.evaluateJavascript(js, null)
@@ -927,20 +959,21 @@ class MainActivity : AppCompatActivity() {
   }
 
   // 持续轮询：购买浮层是用户点附件后由 showWindow AJAX 异步弹出，
-  // 因此必须长期监听，直到页面离开。
-  setInterval(function(){
+  // 因此需要监听一段时间。为省电省 CPU：真正 clearInterval 停止，且只在页面可见时轮询。
+  var timer=setInterval(function(){
     LIFETIME+=400;
     try{
+      // 页面不可见（切到别的界面）时跳过本轮，避免后台空转
+      if(document.hidden) return;
       var hasAttachPayLink=!!document.querySelector('a[href*="attachpay"]');
       if(!handledAny && tryHandle()){
         handledAny=1;
       }
-      // 普通页面(无任何付费附件迹象)只轮询 12 秒即停，避免空转
-      if(!hasAttachPayLink && LIFETIME>12000){
+      // 已点过购买 或 普通页面(无任何付费附件迹象)超时：真正停掉轮询
+      if(handledAny || (!hasAttachPayLink && LIFETIME>12000)){
         window.__sxsyAutopayActive=0;
-        return; // 无法真正清掉自身 interval，但置 0 后不再做任何事，可被再次注入
+        clearInterval(timer);
       }
-      // 页面可能已被完全重新加载(destroy 本 context)，无需处理
     }catch(_){}
   },400);
 
@@ -1089,66 +1122,6 @@ class MainActivity : AppCompatActivity() {
         HistoryStore.add(this, url, title)
     }
 
-    /** 用 CSS 定位提取当前页面「书名」标签，缓存供下载命名用 */
-    private fun extractBookName() {
-        val title = webView.title?.takeIf { it.isNotBlank() }
-        if (title != null) {
-            parseBookNameFromTitle(title)?.let { parsed ->
-                if (cachedBookName.isNullOrBlank()) {
-                    cachedBookName = parsed
-                    DebugLog.log("BOOK", "同步书名(标题解析,缓存为空): $parsed")
-                }
-            }
-        }
-        val js = """
-(function(){
-  try{
-    var el = document.querySelector('#thread_subject') || document.querySelector('h1.ts');
-    if(el){
-      var t = (el.textContent || el.innerText || '').replace(/\s+/g,' ').trim();
-      if(t && t.length >= 2) return t;
-    }
-    return '';
-  }catch(e){ return ''; }
-})();
-""".trimIndent()
-        webView.evaluateJavascript(js) { res ->
-            val clean = res?.trim()?.removePrefix("\"")?.removeSuffix("\"") ?: ""
-            if (clean.isNotBlank() && clean.length <= 200) {
-                cachedBookName = clean
-                DebugLog.log("BOOK", "CSS提取到书名(帖子页): $clean")
-            } else {
-                DebugLog.log("BOOK", "非帖子页，未提取书名 @ ${webView.url}")
-            }
-        }
-    }
-
-    /** 从 document.title 解析书名：取第一个不含站点名/后缀/系统提示词的片段 */
-    private fun parseBookNameFromTitle(title: String): String? {
-        val parts = title.split(Regex("\\s*-\\s*"))
-        for (p in parts) {
-            val t = p.trim()
-            if (t.isNotEmpty() && !Regex("(?i)Powered by Discuz|尚香|书苑|书院|Discuz|论坛|书吧|网站|提示信息|提示|错误|系统|登录|注册").containsMatchIn(t)) {
-                return t
-            }
-        }
-        return null
-    }
-
-    /** 判断书名是否可用（过滤系统提示页标题/空值等） */
-    private fun isUsableBookName(name: String): Boolean {
-        if (name.isBlank()) return false
-        val t = name.trim()
-        if (t.length < 2) return false
-        if (!t.any { it in '\u4e00'..'\u9fff' }) return false
-        if (Regex("(?i)^(提示信息|提示|错误提示|系统提示|登录|注册|下载|附件|Powered by Discuz|尚香书苑|尚香书院|论坛|书吧)$").containsMatchIn(t)) return false
-        return true
-    }
-
-    /** 统一获取当前有效书名 */
-    private fun currentBookName(): String? =
-        cachedBookName?.takeIf { isUsableBookName(it) }
-
     /** 判定“打不开”类网络错误码 */
     private fun isEntryNetworkError(code: Int): Boolean {
         return code == android.webkit.WebViewClient.ERROR_UNKNOWN ||
@@ -1202,12 +1175,11 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun fetchBegin(cd: String?, mime: String?) {
             val u = pendingFetchUrl ?: return
-            val bn = currentBookName()
             fetchFileName = try {
-                DownloadHelper.resolveWithBookName(u, if (cd.isNullOrBlank()) null else cd, bn)
+                DownloadHelper.resolveFileName(u, if (cd.isNullOrBlank()) null else cd)
             } catch (e: Exception) { "download_" + System.currentTimeMillis() }
             fetchB64.setLength(0)
-            DebugLog.log("FETCH", "浏览器通道命名: $fetchFileName | 书名=$bn | cd=$cd | mime=$mime")
+            DebugLog.log("FETCH", "浏览器通道命名: $fetchFileName | cd=$cd | mime=$mime")
         }
 
         @JavascriptInterface
@@ -1518,19 +1490,16 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "请授予存储权限后重新点击下载", Toast.LENGTH_LONG).show()
             return
         }
-        val cached = cachedBookName?.takeIf { isUsableBookName(it) }
-        val bookName = cached
-            ?: webView.title?.takeIf { it.isNotBlank() }?.let { parseBookNameFromTitle(it) }?.takeIf { isUsableBookName(it) }
+        // 文件名取自下载文件本身（响应头 Content-Disposition → URL 兜底），不再用帖子标题改写
         val fileName = try {
-            DownloadHelper.resolveWithBookName(httpUrl, contentDisposition, bookName)
+            DownloadHelper.resolveFileName(httpUrl, contentDisposition)
         } catch (e: Exception) { "download_" + System.currentTimeMillis() }
-        DebugLog.log("DL", "开始原生下载: $httpUrl | mime=$mimeType | cd=$contentDisposition | 书名=$bookName | 命名=$fileName")
+        DebugLog.log("DL", "开始原生下载: $httpUrl | mime=$mimeType | cd=$contentDisposition | 命名=$fileName")
         val nameDisplay = if (fileName.startsWith("download_")) "自动识别文件名" else fileName
         Toast.makeText(this, "开始下载：$nameDisplay", Toast.LENGTH_SHORT).show()
         DownloadHelper.start(
             this, webView.settings.userAgentString, httpUrl,
-            contentDisposition, webView.url,
-            fallbackName = bookName
+            contentDisposition, webView.url
         ) { origUrl ->
             runBrowserFetch(origUrl)
         }

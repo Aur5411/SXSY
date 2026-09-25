@@ -1,6 +1,6 @@
 # 尚香书院（Discuz! X3.5 小说论坛客户端）
 
-一个基于 **Android WebView** 的 Discuz! X3.5 小说论坛壳应用，当前版本 **v1.3.20**。
+一个基于 **Android WebView** 的 Discuz! X3.5 小说论坛壳应用，当前版本 **v1.6.0**。
 
 ## 主要功能
 
