@@ -54,11 +54,19 @@ import java.io.ByteArrayInputStream
  *  - 派生页面 = 帖子页 + 帖子名旁的分类 tag（filter=typeid）+ 标签页（mod=tag）等；
  *    版块自身翻页（&page=N）不算，仍在原界面内导航。
  *  - 堆叠有上限：版面列表 → 列表型派生页（标签/分类/淘帖）→ 帖子，共 3 层。
- *    从标签列表点进帖子时再开一层，是为了让返回时**标签列表**也不被销毁（否则一样回到第一页）；
+ *    从标签列表点进帖子时会再开一层，是为了让返回时**标签列表也不被销毁**（否则一样回到第一页）；
  *    而帖子之间互跳、列表之间互跳仍在同界面内导航，不会无界堆叠。
+ *    返回键的「入口底线」按页面类型判定（isAtScreenEntry）：入口页自身重定向多出来的那一格
+ *    算入口，用户点开的帖子不算 —— 否则从分区列表点进帖子再返回会一步跨过列表落回上一层。
  *
  * 保留通用辅助：浏览历史、内置 TXT 阅读器入口(在下载管理里打开)、设置(网址/下载目录/历史保留/清数据)、诊断日志。
- * 说明：本版为纯净基础版，不注入任何页面脚本（去广告/自动回复等均未内置）。
+ *
+ * 页面注入脚本（onPageFinished，文档完整解析后）：
+ *  - injectAdBlock()      弹窗广告屏蔽（popadv 插件 + Discuz fwin_ 广告浮层兜底）
+ *  - injectForumCleanup() 摘掉屏蔽版块 + 残留广告节点（规则见 AdBlocker.kt）
+ *  - injectAutoSign()     每日签到自动完成
+ *  - injectAttachPayHook() 付费附件自动购买/下载挂钩
+ * 广告资源另在 shouldInterceptRequest 层直接拦掉（popadv.js 换成空实现）。
  */
 class MainActivity : AppCompatActivity() {
 
@@ -73,6 +81,14 @@ class MainActivity : AppCompatActivity() {
          * 返回时列表已自动加载的多页内容与滚动位置原样还在。
          */
         const val EXTRA_THREAD_MODE = "thread_mode"
+        /**
+         * 本实例在「独立界面堆叠」里的层数：
+         * 0 = 主界面（版面列表）、1 = 列表型派生页（标签 / 分类筛选 / 淘帖）、2 = 帖子。
+         * 用来给堆叠加一个硬上限，避免「标签 → 帖子 → 标签 → 帖子」无限开新界面。
+         */
+        const val EXTRA_SCREEN_DEPTH = "screen_depth"
+        /** 独立界面堆叠上限（最多 3 层：版面列表 → 列表型派生页 → 帖子） */
+        private const val MAX_SCREEN_DEPTH = 2
     }
 
     /** 适配高刷新率屏幕：在同分辨率模式中选刷新率最高的（API 23+） */
@@ -120,6 +136,10 @@ class MainActivity : AppCompatActivity() {
     // （含已追加的多页）与滚动位置原封不动。（1.3.20 起覆盖到分类 tag 与标签页）
     /** 本实例是否为承载「派生页面」的独立界面（历史命名 threadMode） */
     private var threadMode = false
+    /** 本实例在独立界面堆叠里的层数（0 主界面 / 1 列表型派生页 / 2 帖子） */
+    private var screenDepth = 0
+    /** 本实例的入口地址（Intent 带入），供返回键判断「是否已退到本界面底线」使用 */
+    private var entryUrl: String? = null
     /** 刚从这个界面点开帖子（新开了独立界面）：本次 onResume 不重载首页，保住版面列表 */
     private var returningFromThreadScreen = false
 
@@ -134,6 +154,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         threadMode = intent?.getBooleanExtra(EXTRA_THREAD_MODE, false) ?: false
+        screenDepth = intent?.getIntExtra(EXTRA_SCREEN_DEPTH, 0) ?: 0
         applyHighRefreshRate()
         Prefs.setDesktopMode(this, true)
         Prefs.setAdBlock(this, true)
@@ -158,6 +179,7 @@ class MainActivity : AppCompatActivity() {
 
         // 从「历史记录」页带 URL 启动：直接打开该网址
         val openUrl = intent?.getStringExtra(EXTRA_OPEN_URL)
+        entryUrl = openUrl
         if (!openUrl.isNullOrBlank()) {
             handleOpenUrl(openUrl)
         } else if (savedInstanceState == null) {
@@ -291,6 +313,7 @@ class MainActivity : AppCompatActivity() {
                 redirectLoopRetried = false
                 if (DebugLog.isEnabled()) injectClickLogger()
                 injectAdBlock()
+                injectForumCleanup()
                 injectAutoSign()
                 injectAttachPayHook()
                 tryAutoPay()
@@ -304,6 +327,8 @@ class MainActivity : AppCompatActivity() {
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                 val url = request?.url?.toString() ?: return false
                 DebugLog.log("NAV", url)
+                // 已屏蔽的版块（综合区三个外链版块）：不进、不弹站外
+                if (interceptHiddenForum(url)) return true
                 // 版面列表 → 帖子/分类标签/标签页：新开独立界面承载，让列表留在后台（返回即原样恢复）
                 if (openDerivedPageInNewScreen(url)) return true
                 // 畸形登录 URL 自愈：拦下死循环地址，改载干净登录页
@@ -329,6 +354,8 @@ class MainActivity : AppCompatActivity() {
             override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
                 if (url != null) {
                     DebugLog.log("NAV", url)
+                    // 已屏蔽的版块（综合区三个外链版块）：不进、不弹站外
+                    if (interceptHiddenForum(url)) return true
                     // 版面列表 → 帖子/分类标签/标签页：新开独立界面承载，让列表留在后台（返回即原样恢复）
                     if (openDerivedPageInNewScreen(url)) return true
                     selfHealLoginUrl(url)?.let { healed ->
@@ -416,6 +443,12 @@ class MainActivity : AppCompatActivity() {
                 val req = request ?: return null
                 val url = req.url?.toString() ?: return null
                 if (req.method != "GET") return null
+                // 广告资源（popadv 插件、广告联盟脚本/图片）一律不加载。
+                // 只拦子资源：主框架放行交给下面的导航逻辑处理，避免把页面拦成白屏。
+                if (!req.isForMainFrame && AdBlocker.isAdUrl(url)) {
+                    DebugLog.log("AD", "拦截广告资源: $url")
+                    return AdBlocker.blockedResponse(url)
+                }
                 if (!isDownloadCandidate(url)) return null
                 // 主框架附件页必须完全交给 WebView 原生导航，真正返回文件时由 DownloadListener 接管
                 if (req.isForMainFrame) {
@@ -482,6 +515,12 @@ class MainActivity : AppCompatActivity() {
                 view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message?
             ): Boolean {
                 DebugLog.log("POPUP", "新窗口请求 (gesture=$isUserGesture)")
+                // 非用户手势自动弹出的新窗口：广告/劫持的标准特征（浏览器默认也是拦的）。
+                // 用户真正点击的 target=_blank 链接会带 gesture=true，不受影响。
+                if (!isUserGesture) {
+                    DebugLog.log("POPUP", "拦截自动弹窗（非用户手势）")
+                    return true
+                }
                 val popup = WebView(this@MainActivity)
                 popup.settings.javaScriptEnabled = true
                 popup.settings.domStorageEnabled = true
@@ -668,7 +707,7 @@ class MainActivity : AppCompatActivity() {
   if(window.__dzAdBlock) return; window.__dzAdBlock=1;
 
   // 1) CSS 强制隐藏 popadv 弹窗 + 遮罩（!important 压过 JS 的 inline style）
-  var css='#popadv_popmenu,#popadv_popmask{display:none!important;visibility:hidden!important;opacity:0!important;pointer-events:none!important;}';
+  var css='#popadv_popmenu,#popadv_popmask,[id^="popadv_"]{display:none!important;visibility:hidden!important;opacity:0!important;pointer-events:none!important;}';
   // 1b) 隐藏帖子正文/回帖里的图片外显（小说论坛正文为文字，图片多为封面/预览/签名图）
   css+='.t_f img,.t_f a[href*="mod=attachment"] img,td.t_f img,img[id^="aimg_"],img.zoom{display:none!important;}';
   try{
@@ -749,6 +788,19 @@ class MainActivity : AppCompatActivity() {
 })();
 """.trimIndent()
         webView.evaluateJavascript(js, null)
+    }
+
+    /**
+     * 页面清理：摘掉「已屏蔽版块」（综合区三个外链版块）+ 残留的弹窗广告节点。
+     *
+     * 规则与脚本都在 [AdBlocker] 里；这里只负责按需注入并打日志。
+     * 注意：**只在 onPageFinished（文档完整解析后）执行**，且脚本内部只处理 `table.fl_tb`。
+     * 早于此（onPageCommitVisible）或按「空行」全文档清理都会误伤帖子页的布局表格 —— 会显示错位。
+     */
+    private fun injectForumCleanup() {
+        val js = AdBlocker.cleanupJs()
+        webView.evaluateJavascript(js, null)
+        DebugLog.log("AD", "已注入清理脚本（屏蔽版块 ${AdBlocker.HIDDEN_FIDS.joinToString("/")}）")
     }
 
     /**
@@ -1058,32 +1110,50 @@ class MainActivity : AppCompatActivity() {
      * 历史命名（当时只用于帖子页），1.3.20 起覆盖全部派生页面（帖子 / 分类筛选 / 标签）。
      */
     private fun openDerivedPageInNewScreen(url: String): Boolean {
-        if (threadMode) return false                            // 本身就是独立界面
         if (!isDerivedPageUrl(url)) return false                // 只对派生页面生效
-        // 当前已在派生页面时的取舍（既要避免界面无界堆叠，又要保住「列表型」页面）：
-        //  - 当前是「帖子」→ 一律本界面内导航（帖子之间互跳是常态，逐个开新界面会堆一摞 WebView）
-        //  - 当前是「标签 / 分类筛选 / 淘帖等列表」且目标是帖子 → 再开一层。
-        //    这样 版面列表 → 标签列表 → 帖子 这条链路里，返回时标签列表
-        //    （站点 JS 已追加的后续页 + 滚动位置）原样还在，而不是重建回第一页。
-        //  - 其余（列表 → 列表等）→ 保持本界面内导航。
-        // 堆叠深度因此有上限：版面列表 → 列表型派生页 → 帖子，共 3 层，不会无界增长。
-        if (isDerivedPageUrl(lastContentPageUrl) &&
-            !(isDerivedListUrl(lastContentPageUrl) && isThreadUrl(url))
-        ) return false
-        DebugLog.log("NAV", "派生页面新开独立界面（版面列表留在后台）: $url")
+        if (!canStackAnotherScreen(url)) return false           // 已到堆叠上限 / 这一格该留在本界面
+        DebugLog.log("NAV", "派生页面新开独立界面（本界面留在后台）: $url 深度=${screenDepth + 1}")
         return try {
             startActivity(
                 Intent(this, MainActivity::class.java)
                     .putExtra(EXTRA_OPEN_URL, url)
                     .putExtra(EXTRA_THREAD_MODE, true)
+                    .putExtra(EXTRA_SCREEN_DEPTH, screenDepth + 1)
             )
-            // 独立界面盖上来，本界面稍后会 onResume：标记住，别把版面列表重载成首页
+            // 独立界面盖上来，本界面稍后会 onResume：标记住，别把当前页面重载成首页
             returningFromThreadScreen = true
             true
         } catch (e: Exception) {
             DebugLog.log("NAV", "新开独立界面失败，改为本界面内导航: ${e.message}")
             false
         }
+    }
+
+    /**
+     * 是否该为 [url] 再开一层独立界面（堆叠上限 3 层，见 MAX_SCREEN_DEPTH）。
+     *
+     * 层与层的关系：
+     *   第 1 层 主界面 = 版面列表；第 2 层 = 列表型派生页（标签 / 分类筛选 / 淘帖）；
+     *   第 3 层 = 帖子。
+     *
+     * 规则（既要避免界面无界堆叠，又要让每一层列表都不被销毁）：
+     *  - 主界面：当前页已是派生页面时留在本界面内导航，否则开一层；
+     *    （列表 → 帖子这一格必须留在本界面内，这样从帖子返回能回到列表）
+     *  - 第 2 层（本界面入口是「列表型派生页」且当前仍停在该列表上）：目标是帖子时再开一层。
+     *    这就是「点分区里的帖子再返回，却退到总分区列表」的修复点 ——
+     *    旧代码开头一句 `if (threadMode) return false` 把这条分支彻底堵死，
+     *    帖子被塞进列表界面里加载，返回键又按「入口容忍」把它当成重定向残留，
+     *    直接关掉整个界面，于是越过列表掉回上一层。
+     *  - 第 3 层（帖子界面）及更深：一律本界面内导航（帖子互跳是常态，逐个开界面会堆一摞）。
+     */
+    private fun canStackAnotherScreen(url: String): Boolean {
+        val cur = lastContentPageUrl
+        if (!threadMode) {
+            return !isDerivedPageUrl(cur) || (isDerivedListUrl(cur) && isThreadUrl(url))
+        }
+        if (screenDepth >= MAX_SCREEN_DEPTH) return false          // 已到上限
+        if (!isDerivedListUrl(entryUrl)) return false              // 本界面承载的是帖子 → 留在界面内
+        return isDerivedListUrl(cur) && isThreadUrl(url)           // 停在该列表上且目标是帖子
     }
 
     /** 预热 WebView 内核，让冷启动后首次浏览更快 */
@@ -1446,6 +1516,14 @@ class MainActivity : AppCompatActivity() {
             DebugLog.log("POPUP", "吞掉: $url")
             return
         }
+        if (AdBlocker.isAdUrl(url)) {
+            DebugLog.log("POPUP", "拦截广告弹窗: $url")
+            return
+        }
+        if (AdBlocker.isHiddenForumUrl(url)) {
+            DebugLog.log("POPUP", "拦截已屏蔽版块弹窗: $url")
+            return
+        }
         if (isDirectAttachmentUrl(url)) {
             startDirectAttachment(url)
             return
@@ -1555,6 +1633,20 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * 拦截指向「已屏蔽版块」的导航（见 [AdBlocker.HIDDEN_FIDS]）。
+     *
+     * 页面里的版块入口已由注入脚本摘掉，但面包屑、最新回复、搜索结果里仍可能留下这些 fid 的链接；
+     * 这类版块是 Discuz 的「外部链接」型，进去就是站外推广站，一律就地拦下并给一句提示。
+     */
+    private fun interceptHiddenForum(url: String): Boolean {
+        if (!AdBlocker.isHiddenForumUrl(url)) return false
+        val name = AdBlocker.forumIdOf(url)?.let { AdBlocker.HIDDEN_FORUM_NAMES[it] }
+        DebugLog.log("NAV", "拦截已屏蔽版块: $url")
+        Toast.makeText(this, if (name != null) "「$name」已屏蔽" else "该版块已屏蔽", Toast.LENGTH_SHORT).show()
+        return true
+    }
+
+    /**
      * 畸形 Discuz 登录 URL「自愈」：站内出现形如
      *   https://host/index.php/member.php?mod=logging&action=login&referer=…
      *   （index.php 被当成目录，旧版强制补斜杠后才会产生；Discuz 伪静态下 index.php/xxx
@@ -1654,14 +1746,72 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onBackPressed() {
-        // 帖子独立界面：只在入口那一页之上还有历史时才后退；退到入口就不再退了，
-        // 直接关掉本界面回到版面列表（避免登录回跳等自身重定向把用户困在两层之间）。
-        val atEntry = threadMode && (webView.copyBackForwardList()?.currentIndex ?: 0) <= 1
-        if (webView.canGoBack() && !atEntry) {
+        // 独立界面：只在入口那一页之上还有历史时才后退；退到入口就不再退了，
+        // 直接关掉本界面回到上一层（避免登录回跳等自身重定向把用户困在两层之间）。
+        val idx = webView.copyBackForwardList().currentIndex
+        if (webView.canGoBack() && !isAtScreenEntry(idx)) {
             webView.goBack()
         } else {
             super.onBackPressed()
         }
+    }
+
+    /**
+     * 当前这一格历史是否为「本界面的入口」——是则返回键不再后退，直接关掉本界面。
+     *
+     * 不能写死 `currentIndex <= 1`：入口页被站点 302 时确实会多占一格
+     * （如 thread-x-x-x.html → forum.php?mod=viewthread&tid=x、登录态失效时先跳登录页），
+     * 但用户在本界面里点开的帖子同样落在下标 1 上 —— 若一并当成入口残留直接关界面，
+     * 就会一步跨过中间的列表，落回上一层（从分区列表点进帖子再返回，退到总分区列表的根因）。
+     *
+     * 规则：
+     *  - 下标 0：永远是入口；
+     *  - 那一格是帖子：只有与入口是同一个帖子（同 tid 的另一种地址形态）才算入口；
+     *  - 那一格不是帖子（列表 / 登录页等）：只有紧邻入口的下标 1 才算入口残留，
+     *    更深处是用户在本界面内点开的另一个列表，必须能退回去。
+     */
+    private fun isAtScreenEntry(idx: Int): Boolean {
+        if (!threadMode) return false
+        if (idx <= 0) return true
+        val itemUrl = try {
+            webView.copyBackForwardList().getItemAtIndex(idx)?.url
+        } catch (e: Exception) {
+            null
+        }
+        if (itemUrl.isNullOrBlank()) return idx == 1
+        if (isThreadUrl(itemUrl)) return isSameThreadPage(itemUrl, entryUrl)
+        return idx == 1
+    }
+
+    /**
+     * 两个地址是否指向「同一个帖子的同一页」。
+     *
+     * 帖子的地址形态不止一种（`thread-{tid}-{page}-{extra}.html` 与
+     * `forum.php?mod=viewthread&tid=x&page=n`），站点做规范化跳转时会在历史里多占一格，
+     * 这种要视为同一页（否则按返回会被困在原地）；而同一帖子的第 1 页与第 2 页不算同一页，
+     * 否则翻页后按返回会直接退出整个界面。
+     */
+    private fun isSameThreadPage(a: String?, b: String?): Boolean {
+        val ta = threadIdOf(a) ?: return false
+        val tb = threadIdOf(b) ?: return false
+        return ta == tb && threadPageOf(a) == threadPageOf(b)
+    }
+
+    /** 从帖子地址里取数字主题 id（tid），取不到返回 null */
+    private fun threadIdOf(url: String?): String? {
+        if (url.isNullOrBlank()) return null
+        Regex("[?&]tid=(\\d+)").find(url)?.let { return it.groupValues[1] }
+        Regex("/thread-(\\d+)").find(url)?.let { return it.groupValues[1] }
+        return null
+    }
+
+    /** 从帖子地址里取页码（默认第 1 页）；注意不能误吃 `extra=page%3D1` 这类参数 */
+    private fun threadPageOf(url: String?): Int {
+        if (url.isNullOrBlank()) return 1
+        Regex("[?&]page=(\\d+)").find(url)?.let { return it.groupValues[1].toIntOrNull() ?: 1 }
+        // 伪静态形态 thread-{tid}-{page}-{extra}.html
+        Regex("/thread-\\d+-(\\d+)-").find(url)?.let { return it.groupValues[1].toIntOrNull() ?: 1 }
+        return 1
     }
 
     /** 诊断日志弹窗：查看 / 复制 / 清空 */
