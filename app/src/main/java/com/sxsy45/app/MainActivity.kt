@@ -63,7 +63,7 @@ import java.io.ByteArrayInputStream
  *
  * 页面注入脚本（onPageFinished，文档完整解析后）：
  *  - injectAdBlock()      弹窗广告屏蔽（popadv 插件 + Discuz fwin_ 广告浮层兜底）
- *  - injectForumCleanup() 摘掉屏蔽版块 + 残留广告节点（规则见 AdBlocker.kt）
+ *  - injectForumCleanup() 摘掉外链推广分区 + 残留广告节点（规则见 AdBlocker.kt）
  *  - injectAutoSign()     每日签到自动完成
  *  - injectAttachPayHook() 付费附件自动购买/下载挂钩
  * 广告资源另在 shouldInterceptRequest 层直接拦掉（popadv.js 换成空实现）。
@@ -791,16 +791,20 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 页面清理：摘掉「已屏蔽版块」（综合区三个外链版块）+ 残留的弹窗广告节点。
+     * 页面清理：摘掉「外链推广分区」（Discuz redirect 型，官方文案「链接到外部地址」）
+     * + 残留的弹窗广告节点。
      *
      * 规则与脚本都在 [AdBlocker] 里；这里只负责按需注入并打日志。
-     * 注意：**只在 onPageFinished（文档完整解析后）执行**，且脚本内部只处理 `table.fl_tb`。
+     * 注意：**只在 onPageFinished（文档完整解析后）执行**，且脚本内部只处理
+     * `table.fl_tb` 里的 `td.fl_g` 格子。论坛页里塞广告图片/区块链接是外链分区自身的性质，
+     * 只有整块格子（或整行）被摘掉、该行仍留有其它非广告内容时才保留，
+     * 这样广告消失且不影响正常帖子的图文排版。
      * 早于此（onPageCommitVisible）或按「空行」全文档清理都会误伤帖子页的布局表格 —— 会显示错位。
      */
     private fun injectForumCleanup() {
         val js = AdBlocker.cleanupJs()
         webView.evaluateJavascript(js, null)
-        DebugLog.log("AD", "已注入清理脚本（屏蔽版块 ${AdBlocker.HIDDEN_FIDS.joinToString("/")}）")
+        DebugLog.log("AD", "已注入清理脚本（外链分区按官方文案识别）")
     }
 
     /**
@@ -1210,6 +1214,26 @@ class MainActivity : AppCompatActivity() {
             if (!info.isNullOrBlank()) DebugLog.log("CLICK", info)
         }
 
+        /**
+         * 页面清理脚本发现的「外链推广分区」fid（逗号分隔）转交 [AdBlocker] 记账。
+         *
+         * 这样站点新增外链分区时，**导航层拦截（面包屑/最新回复/搜索结果里的残留链接）
+         * 也会自动跟上**，不必改代码重装。参数来自页面自身文本，无需校验。
+         */
+        @JavascriptInterface
+        fun reportExternalForums(csv: String?) {
+            if (csv.isNullOrBlank()) return
+            AdBlocker.rememberExternalFids(csv)
+        }
+
+        /**
+         * 页面清理脚本上报的外链分区名，让拦截提示能说出具体是哪个分区（如「黄果短剧是外链推广站」）。
+         */
+        @JavascriptInterface
+        fun reportExternalForumName(fid: Int, name: String?) {
+            AdBlocker.rememberForumName(fid, name)
+        }
+
         /** 自动签到结果提示 */
         @JavascriptInterface
         fun signNotice(msg: String?) {
@@ -1521,7 +1545,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         if (AdBlocker.isHiddenForumUrl(url)) {
-            DebugLog.log("POPUP", "拦截已屏蔽版块弹窗: $url")
+            DebugLog.log("POPUP", "拦截外链推广分区弹窗: $url")
             return
         }
         if (isDirectAttachmentUrl(url)) {
@@ -1633,16 +1657,18 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 拦截指向「已屏蔽版块」的导航（见 [AdBlocker.HIDDEN_FIDS]）。
+     * 拦截指向「外链推广分区」的导航。
      *
      * 页面里的版块入口已由注入脚本摘掉，但面包屑、最新回复、搜索结果里仍可能留下这些 fid 的链接；
-     * 这类版块是 Discuz 的「外部链接」型，进去就是站外推广站，一律就地拦下并给一句提示。
+     * 这类分区是 Discuz 的「外部链接（redirect）」型，进去就是站外推广站，一律就地拦下并给一句提示。
+     * 判据见 [AdBlocker]：fid 由页面里的官方文案「链接到外部地址」自动学习，无需硬编码。
      */
     private fun interceptHiddenForum(url: String): Boolean {
         if (!AdBlocker.isHiddenForumUrl(url)) return false
-        val name = AdBlocker.forumIdOf(url)?.let { AdBlocker.HIDDEN_FORUM_NAMES[it] }
-        DebugLog.log("NAV", "拦截已屏蔽版块: $url")
-        Toast.makeText(this, if (name != null) "「$name」已屏蔽" else "该版块已屏蔽", Toast.LENGTH_SHORT).show()
+        val fid = AdBlocker.forumIdOf(url)
+        val name = AdBlocker.forumNameOf(fid)
+        DebugLog.log("NAV", "拦截外链推广分区: $url")
+        Toast.makeText(this, if (name != null) "「$name」是外链推广站，已屏蔽" else "该版块为外链推广站，已屏蔽", Toast.LENGTH_SHORT).show()
         return true
     }
 
