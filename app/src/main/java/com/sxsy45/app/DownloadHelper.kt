@@ -468,9 +468,15 @@ object DownloadHelper {
         val ct = conn.contentType ?: ""
         val cd = conn.getHeaderField("Content-Disposition")
         val ctLow = ct.lowercase()
-        val isFile = cd?.contains("attachment", ignoreCase = true) == true ||
-            (isBinaryContentType(ctLow) && !ctLow.startsWith("text/") &&
-                !ctLow.contains("xml") && !ctLow.contains("json"))
+        // 只有**真正的网页类型**才算「网页」，其余一律按文件处理。
+        //
+        // 旧判据是「有 Content-Disposition 的 attachment，或是非文本的二进制类型才算文件」，
+        // 于是 `text/plain` + 没有 Content-Disposition 的**直链附件**（本站的
+        // /data/attachment/forum/…/xxx.txt 就是这样）被判成网页 → 只读 1MB 就放行给 WebView，
+        // 结果文件名退化成 URL 里的哈希（实测 221630f66g16b3rgcc3g65.txt），大文件也下不全。
+        // 现在只有 html/xhtml 才走「网页」分支（那才是登录墙/提示页），其余按文件走 128MB 上限。
+        val isHtmlish = ctLow.contains("text/html") || ctLow.contains("application/xhtml")
+        val isFile = !isHtmlish || cd?.contains("attachment", ignoreCase = true) == true
         val limit = if (isFile) MAX_DOWNLOAD_BYTES else MAX_PROBE_HTML_BYTES
         val temp = File.createTempFile("probe_", ".part", ctx.cacheDir)
         var keep = false

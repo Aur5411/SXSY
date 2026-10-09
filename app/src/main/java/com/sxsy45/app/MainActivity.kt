@@ -964,6 +964,15 @@ class MainActivity : AppCompatActivity() {
      */
     private val attachNames = java.util.concurrent.ConcurrentHashMap<String, String>()
 
+    /**
+     * **直链附件**的 URL → 原始文件名。
+     *
+     * 本站大量使用形如 `/data/attachment/forum/202610/09/221630f66g16b3rgcc3g65.txt` 的直链：
+     * URL 里既没有 aid、末段也只是哈希，名字只能从同一组 DOM 里读出来；
+     * 而原生侧下载用的就是这个 URL，所以直接用完整 URL 当键，下载时一定能对上号。
+     */
+    private val attachNamesByUrl = java.util.concurrent.ConcurrentHashMap<String, String>()
+
 
     /**
      * 从附件下载 URL 求「附件 id」（与注入脚本 auditOf 同一套规则）：
@@ -1004,7 +1013,19 @@ class MainActivity : AppCompatActivity() {
      * 响应头 Content-Disposition → URL 兜底，**绝不拿帖子标题顶替**
      * （多附件帖子标题是「求书，…」这类描述，用它会让所有文件同名）。
      */
-    private fun preferredNameFor(url: String?): String? = nameHintForUrl(url)
+    private fun preferredNameFor(url: String?): String? {
+        if (url.isNullOrBlank()) return null
+        nameHintForUrl(url)?.let { return it }
+        // 直链附件：按完整 URL 查，退化到路径部分（查询串可能不同）。
+        // 查不到就返回 null —— 绝不在多附件页面里随便挑一个名字用，那会让
+        // 「A 的文件存成B 的名字」，比用哈希名更糟。
+        attachNamesByUrl[url]?.let { return it }
+        val path = try {
+            Uri.parse(url).path
+        } catch (e: Exception) { null }
+        if (!path.isNullOrBlank()) attachNamesByUrl[path]?.let { return it }
+        return null
+    }
 
     /**
      * 上报帖子内附件的**原文件名**（下载命名第一优先级）。
@@ -1065,12 +1086,18 @@ class MainActivity : AppCompatActivity() {
     return !t || /^(下载|附件|立即下载|点击下载|点击这里下载|重新下载|免费|购买|记录|查看|下载附件|点击文件名下载附件|download|attach|attachment)$/i.test(t);
   }
 
-  // 文件链接判定：mod=attachment / attachment.php / 付费购买 action=attachpay
+  // 文件链接判定：
+  //   mod=attachment / attachment.php        —— 带 aid 的标准/付费附件
+  //   /data/attachment/...                   —— **直链附件**（本站实际大量使用，形如
+  //     https://sxsy45.com/data/attachment/forum/202610/09/221630f66g16b3rgcc3g65.txt）
+  //     这种链接 URL 里没有 aid、末段只是哈希，名字**只能**从同一组 DOM 里取，
+  //     所以要单独上报并以「完整 URL」为键（原生侧下载用的就是这个 URL，能直接对上）。
   // 排除 action=viewattachpayments（那是「记录」页，不是文件）
   function isFileLink(href){
     if(!href) return false;
     if(/viewattachpayments/i.test(href)) return false;
-    return /mod=attachment/i.test(href) || /attachment\.php/i.test(href) || /action=attachpay/i.test(href);
+    return /mod=attachment/i.test(href) || /attachment\.php/i.test(href) ||
+           /action=attachpay/i.test(href) || /\/data\/attachment\//i.test(href);
   }
 
   // 从 href 求 Discuz 附件 id（纯数字 aid，或 base64 解码后取第一段）
@@ -1123,10 +1150,12 @@ class MainActivity : AppCompatActivity() {
         }
       }
       // 最后兜底：链接自身文字 / title（部分模板直接把文件名写成链接文字）
+      // ⚠ 必须**带扩展名**才算文件名：本站直链附件的按钮文字是「白嫖下载」，
+      //   没有扩展名，早期版本会把它当成文件名存下来。
       var at=norm(a.textContent);
-      if(!isGeneric(at)) return at;
+      if(!isGeneric(at) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(at)) return at;
       var ti=norm(a.getAttribute && a.getAttribute('title'));
-      if(!isGeneric(ti)) return ti;
+      if(!isGeneric(ti) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(ti)) return ti;
       return '';
     }catch(e){ return ''; }
   }
@@ -1135,18 +1164,26 @@ class MainActivity : AppCompatActivity() {
     try{
       if(!window.DiscuzApp || !window.DiscuzApp.attachName) return;
       var links=document.querySelectorAll(
-        'a[href*="mod=attachment"],a[href*="attachment.php"],a[href*="action=attachpay"]');
+        'a[href*="mod=attachment"],a[href*="attachment.php"],a[href*="action=attachpay"],a[href*="/data/attachment/"]');
       var rows=0;
       for(var i=0;i<links.length;i++){
         var a=links[i], href=a.getAttribute('href')||'';
         if(!isFileLink(href)) continue;
-        var id=auditOf(href);
-        if(!id || reported[id]) continue;
         var nm=nameOf(a);
         if(!nm) continue;
-        reported[id]=1;
+        var id=auditOf(href);
+        if(id){
+          if(reported[id]) continue;
+          reported[id]=1;
+          try{ window.DiscuzApp.attachName(id, nm); }catch(e){}
+        }else{
+          // 直链附件没有 aid → 用**绝对 URL** 做键上报；原生侧下载用的就是这个 URL，能直接对上
+          var key=a.href||href;
+          if(reported[key]) continue;
+          reported[key]=1;
+          try{ window.DiscuzApp.attachNameByUrl(key, nm); }catch(e){}
+        }
         rows++;
-        try{ window.DiscuzApp.attachName(id, nm); }catch(e){}
       }
       // 通知原生「附件名已就绪」：购买成功后的自动下载要等这一刻才触发。
       // 以前是在 onPageFinished 里同步触发的，那时本脚本还没跑完（evaluateJavascript 异步），
@@ -1720,6 +1757,19 @@ class MainActivity : AppCompatActivity() {
             if (clean.isEmpty() || clean.length > 120) return
             attachNames[auditId.trim()] = clean
             DebugLog.log("ATT", "附件名上报: $auditId -> $clean")
+        }
+
+        /**
+         * **直链附件**的原始文件名上报（键是完整 URL）。
+         * 直链没有 aid，只能以 URL 为键；原生侧下载用的就是同一个 URL，所以一定对得上。
+         */
+        @JavascriptInterface
+        fun attachNameByUrl(url: String?, name: String?) {
+            if (url.isNullOrBlank() || name.isNullOrBlank()) return
+            val clean = name.trim().replace(Regex("[\\r\\n\\t]"), " ")
+            if (clean.isEmpty() || clean.length > 160) return
+            attachNamesByUrl[url.trim()] = clean
+            DebugLog.log("ATT", "直链附件名上报: ${url.trim().takeLast(40)} -> $clean")
         }
 
 
