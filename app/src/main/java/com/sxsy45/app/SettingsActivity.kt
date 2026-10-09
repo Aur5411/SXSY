@@ -16,6 +16,7 @@ class SettingsActivity : AppCompatActivity() {
 
     private lateinit var etUrl: EditText
     private lateinit var etDownloadDir: EditText
+    private lateinit var etCustomJs: EditText
     private lateinit var tvRetention: TextView
 
     // 历史记录保留时长选项（值 = 毫秒，0 = 不自动删除）
@@ -40,12 +41,14 @@ class SettingsActivity : AppCompatActivity() {
 
         etUrl = findViewById(R.id.etUrl)
         etDownloadDir = findViewById(R.id.etDownloadDir)
+        etCustomJs = findViewById(R.id.etCustomJs)
         tvRetention = findViewById(R.id.tvRetention)
 
         // 回填当前配置（首次未配置时预填默认网址，用户确认后可保存）
         etUrl.setText(Prefs.getUrl(this).ifBlank { Prefs.DEFAULT_FORUM_URL })
         Prefs.setDesktopMode(this, true)
         etDownloadDir.setText(Prefs.getDownloadDir(this))
+        etCustomJs.setText(Prefs.getCustomJs(this))
         Prefs.setAdBlock(this, true)
         updateRetentionLabel()
 
@@ -144,6 +147,7 @@ class SettingsActivity : AppCompatActivity() {
         Prefs.setUrl(this, raw.ifBlank { Prefs.DEFAULT_FORUM_URL })
         Prefs.setDesktopMode(this, true)
         Prefs.setDownloadDir(this, etDownloadDir.text.toString().trim().ifBlank { "尚香书院" })
+        Prefs.setCustomJs(this, etCustomJs.text.toString())
         Prefs.setAdBlock(this, true)
         Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show()
         finish()
@@ -153,6 +157,8 @@ class SettingsActivity : AppCompatActivity() {
         etUrl.setText(Prefs.DEFAULT_FORUM_URL)
         Prefs.setDesktopMode(this, true)
         etDownloadDir.setText("尚香书院")
+        etCustomJs.setText("")
+        Prefs.setCustomJs(this, "")
         Prefs.setAdBlock(this, true)
         Toast.makeText(this, "已恢复默认（未保存）", Toast.LENGTH_SHORT).show()
     }

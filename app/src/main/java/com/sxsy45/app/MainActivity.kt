@@ -64,9 +64,11 @@ import java.io.ByteArrayInputStream
  * 页面注入脚本（onPageFinished，文档完整解析后）：
  *  - injectAdBlock()      弹窗广告屏蔽（popadv 插件 + Discuz fwin_ 广告浮层兜底）
  *  - injectFirstPostImages() 1 楼楼主发布的图片可直接查看（被站点降级成链接的图片附件还原成内联图）
+ *  - injectAttachNameJs() 读取帖子内附件真实文件名并上报，用于下载时保留原名
  *  - injectForumCleanup() 摘掉外链推广分区 + 残留广告节点（规则见 AdBlocker.kt）
  *  - injectAutoSign()     每日签到自动完成
  *  - injectAttachPayHook() 付费附件自动购买/下载挂钩
+ *  - injectCustomJs()     设置页「自定义脚本（JS）」——最后注入，跑在内置脚本之后
  * 广告资源另在 shouldInterceptRequest 层直接拦掉（popadv.js 换成空实现）。
  */
 class MainActivity : AppCompatActivity() {
@@ -315,10 +317,12 @@ class MainActivity : AppCompatActivity() {
                 if (DebugLog.isEnabled()) injectClickLogger()
                 injectAdBlock()
                 injectFirstPostImages()
+                injectAttachNameJs()
                 injectForumCleanup()
                 injectAutoSign()
                 injectAttachPayHook()
                 tryAutoPay()
+                injectCustomJs()   // 用户自定义脚本最后注入（在内置脚本之后）
                 updateTitle()
                 recordHistory(view, url)
                 // 购买成功后刷新了帖子页：自动找该 aid 已生效的下载链接并下载
@@ -485,8 +489,9 @@ class MainActivity : AppCompatActivity() {
                         DebugLog.log("INTERCEPT", "重复请求，跳过: $url")
                         null
                     } else {
-                        val name = DownloadHelper.resolveFileName(p.finalUrl, p.disposition)
-                        val savedName = DownloadHelper.saveFromFile(this@MainActivity, p.file, name)
+                        val hint = nameHintForUrl(p.finalUrl)
+                        val name = DownloadHelper.resolveFileName(p.finalUrl, p.disposition, hint)
+                        val savedName = DownloadHelper.saveFromFile(this@MainActivity, p.file, name, !hint.isNullOrBlank())
                         p.file.delete()
                         DebugLog.log("INTERCEPT", "已保存: $savedName (${p.size}B)")
                         runOnUiThread {
@@ -941,6 +946,185 @@ class MainActivity : AppCompatActivity() {
 """.trimIndent()
         webView.evaluateJavascript(js, null)
         DebugLog.log("IMG", "已注入 1 楼楼主图片直看脚本")
+    }
+
+    // ---------------- 附件真实文件名（下载重命名用） ----------------
+
+    /**
+     * 附件 id → 帖子内显示的真实文件名。
+     *
+     * 点附件下载时，DownloadListener 给的 contentDisposition 通常是 null，URL 又只是
+     * `forum.php?mod=attachment&aid=<base64>`（解析出来是脚本页名 `forum.php`），
+     * 原生侧**拿不到**用户想要的文件名。唯一可靠的来源是帖子 DOM 里显示的那个名字，
+     * 由 [injectAttachNameJs] 读出后按附件 id 上报到这里（见 JS 桥 `attachName`）。
+     *
+     * 只在内存保留，页面跳转自然覆盖，无需清理策略。
+     */
+    private val attachNames = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /**
+     * 从附件下载 URL 求「附件 id」（与注入脚本 auditOf 同一套规则）：
+     * `?aid=<urlencode(base64)>` 解码后形如 `4563314|61f7b6c2|…`，取 `|` 前第一段；
+     * aid 本身是纯数字时直接用。
+     */
+    private fun auditIdOf(url: String?): String? {
+        if (url.isNullOrBlank()) return null
+        val m = Regex("[?&]aid=([^&#]+)").find(url) ?: return null
+        val raw = try {
+            java.net.URLDecoder.decode(m.groupValues[1], "UTF-8")
+        } catch (e: Exception) { m.groupValues[1] }
+        if (raw.isNotEmpty() && raw.all { it.isDigit() }) return raw
+        return try {
+            // base64 里可能含 '+'，URLDecoder 会把它解成空格，需还原
+            val b64 = raw.replace(' ', '+')
+            val decoded = String(
+                android.util.Base64.decode(b64, android.util.Base64.DEFAULT),
+                Charsets.ISO_8859_1
+            )
+            decoded.substringBefore('|').filter { it.isLetterOrDigit() }.ifBlank { null }
+        } catch (e: Exception) { null }
+    }
+
+    /** 查附件 URL 对应的「帖子内文件名」，查不到返回 null（下载链路据此决定是否原样保留） */
+    private fun nameHintForUrl(url: String?): String? {
+        val id = auditIdOf(url) ?: return null
+        return attachNames[id]
+    }
+
+    /**
+     * 上报帖子内附件的真实文件名。
+     *
+     * Discuz 帖子页附件块结构为
+     * ```
+     * <dl class="tattl"><dd>
+     *   <p class="mbn"><span class="attachname">1.jpg</span><span class="y">免费</span></p>
+     *   <p class="buttons"><a href="forum.php?mod=attachment&aid=<base64>&nothumb=yes"
+     *      id="aid4563314" class="xw1 btn_download">下载</a></p>
+     * </dd></dl>
+     * ```
+     * —— 真实名字在 `<span class="attachname">` 里，而下载链接文字固定是「下载」。
+     *
+     * 上报键用附件 id：`aid` 是 URL 编码的 base64，解码后第一段就是附件 id。
+     */
+    private fun injectAttachNameJs() {
+        val js = """
+(function(){
+  if(window.__dzAttNameInit) return; window.__dzAttNameInit=1;
+  var reported={};
+
+  function norm(s){ return String(s==null?'':s).replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim(); }
+
+  // 通用占位文字（不是文件名）
+  function isGeneric(t){
+    return !t || /^(下载|附件|立即下载|点击下载|点击这里下载|重新下载|免费|download|attach|attachment)$/i.test(t);
+  }
+
+  // 从 href 求 Discuz 附件 id
+  function auditOf(href){
+    try{
+      var m=/[?&]aid=([^&#]+)/.exec(String(href||''));
+      if(!m) return '';
+      // 先百分号解码，再把残留空格还原成 base64 的 '+'（Discuz 把 '+' 编码为 %2B，
+      // 不受影响；只在服务器漏编码时兜底），避免 '+' 被当成空格导致解码失败。
+      var raw=decodeURIComponent(m[1]).replace(/ /g,'+');
+      if(/^[0-9]+${'$'}/.test(raw)) return raw;
+      var txt='';
+      try{ txt=atob(raw); }catch(e){ return ''; }
+      var id=(txt.split('|')[0]||'').replace(/[^0-9A-Za-z]/g,'');
+      return id;
+    }catch(e){ return ''; }
+  }
+
+  // 从链接所在容器找真实文件名
+  function nameOf(a){
+    try{
+      var box=null;
+      try{
+        box = (a.closest && (a.closest('dl.tattl') || a.closest('.pattl'))) || null;
+      }catch(e){ box=null; }
+      if(!box){
+        // 模板差异兜底：逐级上溯找工作里含 .attachname 的容器
+        var n=a, hops=0;
+        while(n && n.nodeType===1 && hops++<6){
+          if(n.querySelector && n.querySelector('.attachname')){ box=n; break; }
+          n=n.parentElement;
+        }
+      }
+      if(box){
+        // 主路径：Discuz 标准模板的 <span class="attachname">真实文件名</span>
+        var sp=box.querySelector('.attachname');
+        var t=norm(sp? sp.textContent : '');
+        if(!isGeneric(t)) return t;
+        // 兜底：容器 dd / .mbn 内首个「像文件名」的文本（含扩展名）
+        var cands=box.querySelectorAll('dd,p,.mbn');
+        for(var i=0;i<cands.length;i++){
+          var x=norm(cands[i].textContent);
+          if(!isGeneric(x) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(x)) return x;
+        }
+      }
+      // 最后兜底：链接自身文字 / title（部分模板直接把文件名写成链接文字）
+      var at=norm(a.textContent);
+      if(!isGeneric(at)) return at;
+      var ti=norm(a.getAttribute && a.getAttribute('title'));
+      if(!isGeneric(ti)) return ti;
+      return '';
+    }catch(e){ return ''; }
+  }
+
+  function scan(){
+    try{
+      if(!window.DiscuzApp || !window.DiscuzApp.attachName) return;
+      var links=document.querySelectorAll('a[href*="mod=attachment"],a[href*="attachment.php"]');
+      for(var i=0;i<links.length;i++){
+        var a=links[i], href=a.getAttribute('href')||'';
+        if(/attachpay/i.test(href)) continue;         // 付费购买浮层，不是文件
+        var id=auditOf(href);
+        if(!id || reported[id]) continue;
+        var nm=nameOf(a);
+        if(!nm) continue;
+        reported[id]=nm;
+        try{ window.DiscuzApp.attachName(id, nm); }catch(e){}
+      }
+    }catch(e){}
+  }
+
+  function start(){
+    scan();
+    // 附件块可能由 AJAX/异步模板插入：监听只置脏位并合并处理，并限时 20 秒拆除，
+    // 避免「回调里扫全文档且永不停止」拖慢主线程。
+    var dirty=false, mo=null;
+    try{
+      mo=new MutationObserver(function(){ dirty=true; });
+      mo.observe(document.documentElement||document.body,{childList:true,subtree:true});
+    }catch(e){}
+    var iv=setInterval(function(){ if(dirty){ dirty=false; scan(); } },300);
+    setTimeout(function(){
+      try{ if(mo){ mo.disconnect(); mo=null; } }catch(e){}
+      try{ clearInterval(iv); }catch(e){}
+      scan();
+    },20000);
+  }
+
+  if(document.readyState==='complete') start();
+  else window.addEventListener('load', start);
+})();
+""".trimIndent()
+        webView.evaluateJavascript(js, null)
+        DebugLog.log("ATT", "已注入附件文件名上报脚本")
+    }
+
+    /**
+     * 用户自定义 JS 脚本（设置页「自定义脚本（JS）」）：每次页面加载完成后注入执行一次，空则不注入。
+     *
+     * 脚本在页面上下文里运行，可访问 `DiscuzApp` 桥（下载、购买、上报等）。
+     * 与内置脚本一样是**独立的一次 evaluateJavascript 调用**，所以用户脚本自身写错
+     * （语法错误）时只会让这一次调用失败，不会影响上面几个内置脚本。
+     */
+    private fun injectCustomJs() {
+        val custom = Prefs.getCustomJs(this).trim()
+        if (custom.isEmpty()) return
+        webView.evaluateJavascript(custom, null)
+        DebugLog.log("SCRIPT", "已注入自定义脚本（${custom.length} 字符）")
     }
 
     /**
@@ -1422,11 +1606,25 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun fetchBegin(cd: String?, mime: String?) {
             val u = pendingFetchUrl ?: return
+            fetchNameHint = nameHintForUrl(u)
             fetchFileName = try {
-                DownloadHelper.resolveFileName(u, if (cd.isNullOrBlank()) null else cd)
+                DownloadHelper.resolveFileName(u, if (cd.isNullOrBlank()) null else cd, fetchNameHint)
             } catch (e: Exception) { "download_" + System.currentTimeMillis() }
             fetchB64.setLength(0)
-            DebugLog.log("FETCH", "浏览器通道命名: $fetchFileName | cd=$cd | mime=$mime")
+            DebugLog.log("FETCH", "浏览器通道命名: $fetchFileName | cd=$cd | mime=$mime | hint=$fetchNameHint")
+        }
+
+        /**
+         * 附件真实文件名上报（注入脚本从帖子 DOM 的 `<span class="attachname">` 读出）。
+         * 点下载时 contentDisposition 为 null、URL 只是脚本页，原生侧只能靠这里拿到帖子里的文件名。
+         */
+        @JavascriptInterface
+        fun attachName(auditId: String?, name: String?) {
+            if (auditId.isNullOrBlank() || name.isNullOrBlank()) return
+            val clean = name.trim().replace(Regex("[\\r\\n\\t]"), " ")
+            if (clean.isEmpty() || clean.length > 120) return
+            attachNames[auditId.trim()] = clean
+            DebugLog.log("ATT", "附件名上报: $auditId -> $clean")
         }
 
         @JavascriptInterface
@@ -1447,7 +1645,7 @@ class MainActivity : AppCompatActivity() {
                     return@runOnUiThread
                 }
                 try {
-                    val savedName = DownloadHelper.save(this@MainActivity, data, fetchFileName)
+                    val savedName = DownloadHelper.save(this@MainActivity, data, fetchFileName, !fetchNameHint.isNullOrBlank())
                     fetchFileName = savedName
                     DebugLog.log("FETCH", "保存成功: $savedName (${data.size}B)")
                     Toast.makeText(
@@ -1493,6 +1691,9 @@ class MainActivity : AppCompatActivity() {
 
     // 浏览器通道状态
     private var pendingFetchUrl: String? = null
+
+    /** 浏览器通道本次下载的「帖子内文件名」（null = 没有名字，按普通流程处理） */
+    private var fetchNameHint: String? = null
     private var fetchFileName: String = ""
     private val fetchB64 = StringBuilder()
 
@@ -1745,16 +1946,17 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "请授予存储权限后重新点击下载", Toast.LENGTH_LONG).show()
             return
         }
-        // 文件名取自下载文件本身（响应头 Content-Disposition → URL 兜底），不再用帖子标题改写
+        // 文件名优先级：帖子内文件名（DOM 上报）→ 响应头 Content-Disposition → URL 兜底
+        val hint = nameHintForUrl(httpUrl)
         val fileName = try {
-            DownloadHelper.resolveFileName(httpUrl, contentDisposition)
+            DownloadHelper.resolveFileName(httpUrl, contentDisposition, hint)
         } catch (e: Exception) { "download_" + System.currentTimeMillis() }
-        DebugLog.log("DL", "开始原生下载: $httpUrl | mime=$mimeType | cd=$contentDisposition | 命名=$fileName")
+        DebugLog.log("DL", "开始原生下载: $httpUrl | mime=$mimeType | cd=$contentDisposition | hint=$hint | 命名=$fileName")
         val nameDisplay = if (fileName.startsWith("download_")) "自动识别文件名" else fileName
         Toast.makeText(this, "开始下载：$nameDisplay", Toast.LENGTH_SHORT).show()
         DownloadHelper.start(
             this, webView.settings.userAgentString, httpUrl,
-            contentDisposition, webView.url
+            contentDisposition, webView.url, hint
         ) { origUrl ->
             runBrowserFetch(origUrl)
         }

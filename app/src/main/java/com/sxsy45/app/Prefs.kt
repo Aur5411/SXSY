@@ -18,6 +18,8 @@ object Prefs {
     private const val KEY_DOWNLOAD_DIR = "download_dir"
     private const val KEY_HISTORY_RETENTION = "history_retention"
     private const val KEY_DEBUG_MENU = "debug_menu"
+    /** 用户自定义 JS 脚本（网页加载完成后注入执行） */
+    private const val KEY_CUSTOM_JS = "custom_js"
     private const val KEY_READER_THEME = "reader_theme"
     private const val KEY_READER_FONT_SIZE = "reader_font_size"
     private const val KEY_READER_POS_PREFIX = "reader_pos_"
@@ -52,6 +54,13 @@ object Prefs {
     /** 历史记录保留时长（毫秒），0 = 永久保留 */
     fun getHistoryRetention(ctx: Context): Long = sp(ctx).getLong(KEY_HISTORY_RETENTION, 0L)
     fun setHistoryRetention(ctx: Context, v: Long) = sp(ctx).edit().putLong(KEY_HISTORY_RETENTION, v).apply()
+
+    /**
+     * 用户自定义 JS 脚本：每次页面加载完成后（内置脚本之后）注入执行一次。
+     * 空串 = 不注入。脚本在页面上下文里跑，可访问 `DiscuzApp` 桥。
+     */
+    fun getCustomJs(ctx: Context): String = sp(ctx).getString(KEY_CUSTOM_JS, "") ?: ""
+    fun setCustomJs(ctx: Context, v: String) = sp(ctx).edit().putString(KEY_CUSTOM_JS, v).apply()
 
     /** 「诊断日志」菜单是否显示（默认关闭，需在设置里开启） */
     fun isDebugMenuVisible(ctx: Context): Boolean = sp(ctx).getBoolean(KEY_DEBUG_MENU, false)

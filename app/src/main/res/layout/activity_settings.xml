@@ -83,7 +83,7 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="下载"
+                    android:text="下载与自定义"
                     android:textColor="#1E293B"
                     android:textStyle="bold"
                     android:textSize="14sp"
@@ -114,6 +114,45 @@
                     android:layout_height="wrap_content"
                     android:layout_marginTop="8dp"
                     android:text="下载文件将存放于系统 Download/目录中。"
+                    android:textColor="#64748B"
+                    android:textSize="12sp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="16dp"
+                    android:text="自定义脚本（JS）"
+                    android:textColor="#1E293B"
+                    android:textStyle="bold"
+                    android:textSize="14sp"
+                    android:textAllCaps="true"
+                    android:letterSpacing="0.05"
+                    android:layout_marginBottom="8dp"/>
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    app:hintEnabled="false">
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/etCustomJs"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:background="#FFFFFF"
+                        android:fontFamily="monospace"
+                        android:gravity="top"
+                        android:hint="在此粘贴 JavaScript 脚本，网页加载后自动执行"
+                        android:minLines="6"
+                        android:padding="12dp"
+                        android:textColor="#1E293B"
+                        android:textSize="14sp" />
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="在内置脚本之后执行；可访问 DiscuzApp 桥。留空则不注入。"
                     android:textColor="#64748B"
                     android:textSize="12sp" />
             </LinearLayout>

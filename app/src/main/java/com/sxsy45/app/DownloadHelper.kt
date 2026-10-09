@@ -40,21 +40,25 @@ object DownloadHelper {
     private const val DOWNLOAD_BUFFER_SIZE = 64 * 1024
 
     /**
+     * @param nameHint 帖子内附件显示的真实文件名（由注入脚本从 DOM 的 `<span class="attachname">`
+     *        读出、按附件 id 上报，见 MainActivity.injectAttachNameJs）。
+     *        这是**最可靠**的名字来源：点下载时 contentDisposition 通常为 null，URL 又只是
+     *        `forum.php?mod=attachment&aid=…`（解析出来是脚本页名），只有帖子里的名字才是用户想要的。
      * @param onHtmlFallback 原生请求最终仍返回网页时回调（主线程），参数为原始下载地址；
      *        传 null 则直接抛错提示
      */
     fun start(
         ctx: Context, userAgent: String, url: String,
         contentDisposition: String?, referer: String?,
+        nameHint: String? = null,
         onHtmlFallback: ((String) -> Unit)? = null
     ) {
         val appCtx = ctx.applicationContext
         thread {
             try {
-                // 文件名取自下载文件本身：响应头 Content-Disposition → URL 最后一段兜底
-                // （不再用帖子标题改写文件名）
-                val presetName = resolveFileName(url, contentDisposition)
-                val finalName = download(appCtx, userAgent, url, presetName, referer, onHtmlFallback)
+                // 文件名优先级：帖子内文件名(nameHint) → 响应头 Content-Disposition → URL 末段兜底
+                val presetName = resolveFileName(url, contentDisposition, nameHint)
+                val finalName = download(appCtx, userAgent, url, presetName, referer, onHtmlFallback, nameHint)
                 if (finalName != null) {
                     mainHandler.post {
                         Toast.makeText(appCtx, "下载完成：$finalName\n保存于 Download/${Prefs.getDownloadDir(appCtx)}", Toast.LENGTH_LONG).show()
@@ -70,8 +74,36 @@ object DownloadHelper {
 
     // ---------------- 文件名处理 ----------------
 
-    /** 从 Content-Disposition / URL 中解析文件名，并做乱码修复 + 去网站标记 */
-    fun resolveFileName(url: String, contentDisposition: String?): String {
+    /**
+     * 从 Content-Disposition / URL 中解析文件名，并做乱码修复 + 去网站标记。
+     *
+     * @param nameHint 帖子内附件显示的真实文件名（最高优先级来源）。
+     *
+     * **nameHint 必须原样使用**，不能对它做「乱码修复」或「去站点标记」，否则会引入两个经典 bug：
+     *  1. 不能调 fixEncoding()：它的用途是「输入已经是乱码，穷举 16 种编码组合再按 scoreName 打分
+     *     选最优」。可 nameHint 来自 DOM，是浏览器**已经解码好的可读中文**，根本不是乱码。
+     *     拿正常书名去跑它等于让它参加「GBK↔UTF-8 双向误解码」的穷举竞赛，实测会被解成
+     *     `\u0010 3Ic}?³Ï¥1-970à…`（控制字符 + ASCII 垃圾）—— 评分只看汉字加分、不惩罚英文数字标点，
+     *     乱码候选反而能靠长度胜出，表现为**下载出来的文件名是乱码**。
+     *  2. 不能调 stripWebsite()：它的 trim 列表含 '【' '】' '（' '）'，本为剥除「【某某网www.x.com】」
+     *     这类水印的装饰括号，却会把**书名自带的【】**一并剥掉：
+     *     `【阳光正好儿媳苏钥】（加料版）.txt` → `阳光正好儿媳苏钥】（加料版）.txt`（首字丢失、留孤儿右括号）。
+     *
+     * 所以这里只在 nameHint **本身确实含 U+FFFD 或典型乱码特征**（说明上游就已经坏了）时才尝试修复。
+     */
+    fun resolveFileName(url: String, contentDisposition: String?, nameHint: String? = null): String {
+        // 0. 最高优先级：帖子内显示的文件名
+        if (!nameHint.isNullOrBlank()) {
+            val raw = nameHint.trim()
+            val needsRepair = raw.contains('\uFFFD') || looksMojibake(raw)
+            val cleaned = (if (needsRepair) fixEncoding(raw) else raw)
+                .replace(Regex("[\\\\/:*?\"<>|\\uFFFD]"), "_")
+                .trim()
+            if (cleaned.isNotBlank() && !looksLikeScriptOrGenericPage(cleaned)) {
+                return cleaned
+            }
+        }
+
         var name: String? = null
 
         // 1. Content-Disposition 中的 filename*=（RFC 5987 编码）
@@ -567,14 +599,14 @@ object DownloadHelper {
      * 兼容旧调用方：小字节数组先落到缓存文件，再复用统一的流式保存路径。
      * 大文件下载路径不应调用此方法，应直接调用 saveFromFile。
      */
-    fun save(ctx: Context, data: ByteArray, fileName: String): String {
+    fun save(ctx: Context, data: ByteArray, fileName: String, preserveName: Boolean = false): String {
         if (data.size.toLong() > MAX_DOWNLOAD_BYTES) {
             throw IOException("下载文件超过 ${MAX_DOWNLOAD_BYTES / (1024L * 1024L)} MB 限制")
         }
         val temp = File.createTempFile("download_", ".part", ctx.cacheDir)
         return try {
             FileOutputStream(temp).use { it.write(data) }
-            saveFromFile(ctx, temp, fileName)
+            saveFromFile(ctx, temp, fileName, preserveName)
         } finally {
             temp.delete()
         }
@@ -607,8 +639,11 @@ object DownloadHelper {
 
     /**
      * 从缓存文件流式保存到 Download 目录，整个过程只保留固定大小的复制缓冲区。
+     *
+     * @param preserveName 文件名来自帖子内 attachname 时为 true：原样保留，不剥站点标记、
+     *        不做多编码猜测（详见 [resolveFileName] 的说明）。
      */
-    fun saveFromFile(ctx: Context, source: File, fileName: String): String {
+    fun saveFromFile(ctx: Context, source: File, fileName: String, preserveName: Boolean = false): String {
         if (!source.isFile || !source.canRead()) throw IOException("下载临时文件不可读")
         val size = source.length()
         if (size <= 0L) throw IOException("下载文件为空")
@@ -617,7 +652,7 @@ object DownloadHelper {
         }
         // 用文件真实内容（魔数）识别类型，据此补/校正扩展名与 MIME，而非只靠文件名猜
         val fileType = detectFileType(source)
-        var finalName = normalizeSavedFileName(fileName, fileType)
+        var finalName = normalizeSavedFileName(fileName, fileType, preserveName)
         if (Build.VERSION.SDK_INT >= 29) {
             finalName = ensureUniqueNameMediaStore(ctx, finalName)
         }
@@ -634,7 +669,8 @@ object DownloadHelper {
     private fun download(
         ctx: Context, userAgent: String, url: String,
         presetName: String, referer: String?,
-        onHtmlFallback: ((String) -> Unit)?
+        onHtmlFallback: ((String) -> Unit)?,
+        nameHint: String? = null
     ): String? {
         var currentUrl = url
         var currentReferer = referer ?: url
@@ -694,10 +730,11 @@ object DownloadHelper {
                 throw IOException("返回的是网页而非文件（$currentUrl）\n请确认已在论坛登录，附件权限足够")
             }
 
-            // 文件名始终取自下载文件本身：每跳都用最新响应头 filename 刷新，URL 兜底已在 presetName 里。
+            // 文件名优先用「帖子内显示的文件名」(nameHint)；没有才用响应头 filename 刷新，
+            // URL 兜底已在 presetName 里。（响应头乱码由 resolveFileName 内的 fixEncoding 处理）
             if (respCd != null) {
                 try {
-                    val re = resolveFileName(currentUrl, respCd)
+                    val re = resolveFileName(currentUrl, respCd, nameHint)
                     if (isGarbledName(re)) {
                         name = if (!isGarbledName(name)) name else "download_" + System.currentTimeMillis()
                         DebugLog.log("DL", "文件名无效，用时间戳兜底: $name (原解析='$re')")
@@ -710,9 +747,13 @@ object DownloadHelper {
 
             // 下载内容先限额读入临时文件，避免大 TXT 形成整文件内存副本。
             val temp = File.createTempFile("download_", ".part", ctx.cacheDir)
+            // 名字来自帖子内 attachname 时原样保留（不剥站点标记、不做多编码猜测）。
+            // 只以 nameHint 是否存在为准：即使响应头把 name 换成了别的（含 (1) 后缀等），
+            // 也不能因此丢掉「原样保留」语义 —— 用户要的就是帖子里的那个文件名。
+            val keepAsIs = !nameHint.isNullOrBlank()
             val finalName = try {
                 conn.inputStream.use { input -> copyLimitedToFile(input, temp, MAX_DOWNLOAD_BYTES) }
-                saveFromFile(ctx, temp, name)
+                saveFromFile(ctx, temp, name, keepAsIs)
             } finally {
                 temp.delete()
             }
@@ -894,7 +935,29 @@ object DownloadHelper {
         return UNKNOWN_FILE_TYPE
     }
 
-    private fun normalizeSavedFileName(fileName: String, fileType: FileType): String {
+    /** preserveName 时认可「已有扩展名」的集合（含图片类：帖子里的附件名本身可能就是张图） */
+    private val PRESERVE_KNOWN_EXTS = setOf(
+        ".txt", ".zip", ".epub", ".pdf", ".rar", ".7z", ".gz",
+        ".mobi", ".azw3", ".azw", ".chm", ".umd", ".html", ".htm",
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"
+    )
+
+    private fun normalizeSavedFileName(fileName: String, fileType: FileType, preserveName: Boolean = false): String {
+        // preserveName：名字来自帖子内 attachname —— **原样保留**。
+        // 不剥站点标记（stripWebsite 会把书名自带的【】剥掉）、不做多编码猜测（会把正常中文解码坏），
+        // 只在帖子里的名字**确实缺扩展名**时，按文件真实类型补一个后缀，主体一字不改。
+        if (preserveName) {
+            val safe = fileName
+                .replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001F\\uFFFD]"), "_")
+                .trim()
+            if (safe.isNotBlank()) {
+                val dotIdx = safe.lastIndexOf('.')
+                val hasExt = dotIdx > 0 && safe.substring(dotIdx).lowercase() in PRESERVE_KNOWN_EXTS
+                if (hasExt || fileType.ext.isEmpty()) return safe
+                return safe + fileType.ext
+            }
+        }
+
         // 不做乱码修复/重命名：站点返回的文件名本身不乱码。
         // 只做两件事：清理非法字符、去掉文件名前面的站点标记。
         // 注意 stripWebsite 必须在「含扩展名的完整名」上调用——它靠最后一个点拆 base/ext，
