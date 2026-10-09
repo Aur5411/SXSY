@@ -91,8 +91,8 @@ object DownloadHelper {
      *
      * 所以这里只在 nameHint **本身确实含 U+FFFD 或典型乱码特征**（说明上游就已经坏了）时才尝试修复。
      *
-     * 另外：nameHint 无论来自帖子标题（经 [bookTitleOf] 取书名号）还是帖子内附件名，
-     * 最后都会过一遍 [stripSiteWatermark] —— 文件名里只要出现站点标记（sxsy.org 等）就一律去掉。
+     * nameHint 来自帖子内附件的原始文件名，最后会过一遍 [stripSiteWatermark] ——
+     * 文件名里只要出现站点标记（sxsy.org / soushu2025.com 等）就一律去掉。
      */
     fun resolveFileName(url: String, contentDisposition: String?, nameHint: String? = null): String {
         // 0. 最高优先级：帖子标题（书名号内）或帖子内附件名
@@ -404,52 +404,8 @@ object DownloadHelper {
         return s.ifBlank { "download" }
     }
 
-    /**
-     * 取帖子里的小说标题：**书名 +（可选）章节**。
-     *
-     * 匹配规则只有两个记号（按需求）：
-     *  - `《》` 圈出**书名**（只取里面的字，不带书名号）；
-     *  - `-` 连字符圈出**章节**：`数字-数字` 这种区间（1-9 / 01-10 / 1-9章）。
-     *    章节**不要求外面有括号** —— `《书名》（1-9）`、`《书名》1-9`、`《书名》(1-9)`
-     *    都能识别，识别后统一输出成全角括号 `书名（1-9）`。
-     *  - 连字符变体 `–` `—` `－` 全都认，输出统一规范成普通 `-`；全角数字也能认。
-     *  - 找不到区间就**只留书名**（`（1）`、`（全本）`、`（第一章）` 都不算章节）。
-     *  - 标题里没有 `《》`（或内层为空、`《` 未闭合）→ 直接用标题原文。
-     *
-     * 书名号只认 `《》` 一种（按需求指定）。刻意不认 `〈〉「」『』`，更不认 `【】`
-     * ——这类论坛的 【】 常是「[完结]」「[VIP]」这类前缀标签而非书名号，取内层会得到标签。
-     */
-    fun bookTitleOf(title: String): String {
-        val t = title.replace('\u00A0', ' ').replace(Regex("\\s+"), " ").trim()
-        if (t.isEmpty()) return ""
-
-        val i = t.indexOf('《')
-        val close = if (i >= 0) t.indexOf('》', i + 1) else -1
-        val hasBook = close > i + 1
-        // 没有《》（或内层为空）→ 直接用标题原文，**不再去抠章节**
-        // （否则「书名 1-9」这种无书名号标题会被拼成「书名 1-9（1-9）」）
-        if (!hasBook) return t
-        val book = t.substring(i + 1, close).trim()
-        if (book.isEmpty()) return t
-
-        // 章节：在《》之后找第一个「数字-数字」（括号可有可无），规范化后补在书名后面
-        val m = Regex("[0-9０-９]{1,4}\\s*[-–—－]\\s*[0-9０-９]{1,4}").find(t.substring(close + 1))
-        if (m != null) {
-            // 全角数字转半角、连字符统一成 '-'，去掉数字之间的空格
-            val range = buildString {
-                for (ch in m.value) {
-                    when {
-                        ch in '０'..'９' -> append('0' + (ch - '０'))
-                        ch == '–' || ch == '—' || ch == '－' -> append('-')
-                        ch.isWhitespace() -> Unit
-                        else -> append(ch)
-                    }
-                }
-            }
-            if (range.isNotBlank()) return "$book（$range）"
-        }
-        return book
-    }
+    // 注：原先还有 bookTitleOf()（从帖子标题用《》取书名、用「数字-数字」取章节）作为命名兜底，
+    // 已按需求删除 —— **只用附件原来的名字**，拿不到就交给响应头 / URL 兜底。
 
     /** 按 MIME 猜扩展名（公开：浏览器通道保存时也用） */
     fun guessExt(mimeType: String?): String {

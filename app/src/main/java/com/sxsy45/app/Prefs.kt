@@ -20,14 +20,6 @@ object Prefs {
     private const val KEY_DEBUG_MENU = "debug_menu"
     /** 用户自定义 JS 脚本（网页加载完成后注入执行） */
     private const val KEY_CUSTOM_JS = "custom_js"
-    /** 下载命名脚本（对每个附件跑一次，用 return 返回文件名） */
-    private const val KEY_NAME_SCRIPT = "name_script"
-
-    /** 命名脚本的默认内容放在 assets/name_rules.js，这里只是兜底（读不到资源时用） */
-    const val FALLBACK_NAME_SCRIPT = """
-        var name = v.attach || (v.book ? v.book + (v.chapter ? '（' + v.chapter + '）' : '') : '');
-        return name;
-    """
     private const val KEY_READER_THEME = "reader_theme"
     private const val KEY_READER_FONT_SIZE = "reader_font_size"
     private const val KEY_READER_POS_PREFIX = "reader_pos_"
@@ -69,21 +61,6 @@ object Prefs {
      */
     fun getCustomJs(ctx: Context): String = sp(ctx).getString(KEY_CUSTOM_JS, "") ?: ""
     fun setCustomJs(ctx: Context, v: String) = sp(ctx).edit().putString(KEY_CUSTOM_JS, v).apply()
-
-    /**
-     * 下载命名脚本：为空表示用默认脚本（assets/name_rules.js）。
-     * 脚本在**页面上下文**里对每个附件执行一次，用 `return` 返回文件名（不含扩展名）。
-     */
-    fun getNameScript(ctx: Context): String =
-        sp(ctx).getString(KEY_NAME_SCRIPT, "") ?: ""
-
-    fun setNameScript(ctx: Context, v: String) = sp(ctx).edit().putString(KEY_NAME_SCRIPT, v).apply()
-
-    /** 取默认命名脚本：优先读 assets，读不到用 [FALLBACK_NAME_SCRIPT] */
-    fun defaultNameScript(ctx: Context): String = try {
-        ctx.assets.open("name_rules.js").use { it.readBytes().toString(Charsets.UTF_8) }
-            .ifBlank { FALLBACK_NAME_SCRIPT }
-    } catch (e: Exception) { FALLBACK_NAME_SCRIPT }
 
     /** 「诊断日志」菜单是否显示（默认关闭，需在设置里开启） */
     fun isDebugMenuVisible(ctx: Context): Boolean = sp(ctx).getBoolean(KEY_DEBUG_MENU, false)

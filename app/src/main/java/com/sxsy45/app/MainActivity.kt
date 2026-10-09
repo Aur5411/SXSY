@@ -65,7 +65,6 @@ import java.io.ByteArrayInputStream
  *  - injectAdBlock()      弹窗广告屏蔽（popadv 插件 + Discuz fwin_ 广告浮层兜底）
  *  - injectFirstPostImages() 1 楼楼主发布的图片可直接查看（被站点降级成链接的图片附件还原成内联图）
  *  - injectAttachNameJs() 读取帖子内附件真实文件名并上报，用于下载时保留原名
- *  - injectThreadTitleJs() 读取帖子标题（`#thread_subject`）上报，下载命名按《》取书名
  *  - injectForumCleanup() 摘掉外链推广分区 + 残留广告节点（规则见 AdBlocker.kt）
  *  - injectAutoSign()     每日签到自动完成
  *  - injectAttachPayHook() 付费附件自动购买/下载挂钩
@@ -308,8 +307,6 @@ class MainActivity : AppCompatActivity() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 progressBar.visibility = View.VISIBLE
                 if (url != null && !isDownloadCandidate(url)) lastContentPageUrl = url
-                // 换页即清空上一帖的标题：否则在列表页点附件会拿上一帖的标题当文件名
-                currentThreadTitle = null
                 DebugLog.log("PAGE", "加载开始: $url")
             }
 
@@ -321,7 +318,6 @@ class MainActivity : AppCompatActivity() {
                 injectAdBlock()
                 injectFirstPostImages()
                 injectAttachNameJs()
-                injectThreadTitleJs()
                 injectForumCleanup()
                 injectAutoSign()
                 injectAttachPayHook()
@@ -329,8 +325,10 @@ class MainActivity : AppCompatActivity() {
                 injectCustomJs()   // 用户自定义脚本最后注入（在内置脚本之后）
                 updateTitle()
                 recordHistory(view, url)
-                // 购买成功后刷新了帖子页：自动找该 aid 已生效的下载链接并下载
-                tryAutoDownloadAfterBuy()
+                // 购买成功后刷新了帖子页：自动找该 aid 已生效的下载链接并下载。
+                // 排在附件名上报之后（injectAttachNameJs 会回调 attachNamesReady 提前触发）；
+                // 这里只是兜底排一次，避免 JS 桥没回调时卡住不下载。
+                webView.postDelayed({ tryAutoDownloadAfterBuy() }, 800)
                 DebugLog.log("PAGE", "加载完成: $url | title=${view?.title}")
             }
 
@@ -966,11 +964,6 @@ class MainActivity : AppCompatActivity() {
      */
     private val attachNames = java.util.concurrent.ConcurrentHashMap<String, String>()
 
-    /**
-     * 当前帖子的标题（由 [injectThreadTitleJs] 从 `#thread_subject` 上报）。
-     * 下载命名时按它取书名号内的书名；换页时清空（见 `onPageStarted`）。
-     */
-    @Volatile private var currentThreadTitle: String? = null
 
     /**
      * 从附件下载 URL 求「附件 id」（与注入脚本 auditOf 同一套规则）：
@@ -1002,25 +995,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 下载文件名基准：**附件原名优先，拿不到才用帖子标题**。
+     * 下载文件名：**只用附件原来的名字**（按需求，帖子标题不再参与命名）。
      *
-     * 真实站点数据（`sxsy45.com`，抓了 3 个帖子页实测）：
-     * - 单文件小说帖：附件名 `淫童降世之从淫荡骚母开始(1-11).txt`，比标题推导更贴切；
-     * - 多文件求书帖（18 个附件散在 10 个楼层里）：标题是「求书，绿母+乱…」这种**描述**，
-     *   根本不是书名，若按标题命名会让 18 个文件全部同名、互相覆盖。
+     * 名字来自帖子 DOM 里显示的那个文件名（[injectAttachNameJs] 按附件 id 上报），
+     * 站点标记 `[sxsy.org]` / `soushu2025.com` / `@` 由 [DownloadHelper.stripSiteWatermark] 去掉。
      *
-     * 所以顺序是：附件原名 → 帖子标题（`《》` 取书名 + `-` 取章节，见 [DownloadHelper.bookTitleOf]）
-     * → 响应头 → URL。附件名仍会过 [DownloadHelper.stripSiteWatermark] 去掉站点标记。
+     * 拿不到附件原名时返回 null —— 交给 [DownloadHelper.resolveFileName] 按
+     * 响应头 Content-Disposition → URL 兜底，**绝不拿帖子标题顶替**
+     * （多附件帖子标题是「求书，…」这类描述，用它会让所有文件同名）。
      */
-    private fun preferredNameFor(url: String?): String? {
-        nameHintForUrl(url)?.let { return it }
-        val t = currentThreadTitle
-        if (!t.isNullOrBlank()) {
-            val base = DownloadHelper.bookTitleOf(t)
-            if (base.isNotBlank()) return base
-        }
-        return null
-    }
+    private fun preferredNameFor(url: String?): String? = nameHintForUrl(url)
 
     /**
      * 上报帖子内附件的**原文件名**（下载命名第一优先级）。
@@ -1044,14 +1028,31 @@ class MainActivity : AppCompatActivity() {
      *
      * 上报键用附件 id：尚香是纯数字 `aid=631539`，搜书吧是 base64，两种都支持（见 [auditIdOf]）。
      */
+    /**
+     * 上报帖子内附件的**原文件名**，以及帖子标题。**只读不改名** —— 重命名规则在 Kotlin 侧
+     * 名字统一在 Kotlin 侧清洗（[DownloadHelper.stripSiteWatermark] 去站点标记），
+     * 这里只负责把 DOM 里的原始信息取出来。
+     *
+     * 站点实测有两种附件块形态（`sxsy45.com`）：
+     * ```
+     * ① 标准模板：
+     * <dl class="tattl"><dd><p class="mbn"><span class="attachname">1.jpg</span></p>
+     *   <a href="forum.php?mod=attachment&aid=<base64>">下载</a></dd></dl>
+     *
+     * ② 尚香书苑（实测 18 个附件全是这种，**没有 .attachname**，且都是付费附件）：
+     * <dl class="tattl"><dt><img class="vm"></dt><dd>
+     *   <p class="attnm"><a href="forum.php?mod=misc&amp;action=attachpay&amp;aid=631539&amp;tid=327909"
+     *      onclick="showWindow('attachpay', this.href)">[sxsy.org]soushu2025.com@陪读母亲的性事 1-12….txt</a></p>
+     *   <p>售价: <strong>1 金钱</strong> … [<a …action=viewattachpayments…>记录</a>] [<a …attachpay…>购买</a>]</p>
+     * </dd></dl>
+     * ```
+     * 形态 ② 里**真实文件名就是 `<a>` 的链接文字**，且链接是 `action=attachpay`（付费购买入口，
+     * 点它会走 App 自己的 `handleAttachPay` 购买流程）—— 所以**不能跳过 attachpay**，
+     * 否则一个文件名都拿不到；真正要跳过的只有 `viewattachpayments`（那个是「记录」）。
+     *
+     * 上报键用附件 id：尚香是纯数字 `aid=631539`，搜书吧是 base64，两种都支持（见 [auditIdOf]）。
+     */
     private fun injectAttachNameJs() {
-        // 命名脚本正文（设置页可编辑，默认来自 assets/name_rules.js）。
-        // 转义后嵌进注入脚本里，用 new Function('v', src) 逐个附件执行。
-        val userSrc = (Prefs.getNameScript(this).ifBlank { Prefs.defaultNameScript(this) })
-            .replace("\\", "\\\\")
-            .replace("'", "\\'")
-            .replace("\r", "")
-            .replace("\n", "\\n")
         val js = """
 (function(){
   if(window.__dzAttNameInit) return; window.__dzAttNameInit=1;
@@ -1088,7 +1089,7 @@ class MainActivity : AppCompatActivity() {
     }catch(e){ return ''; }
   }
 
-  // 从链接所在容器找真实文件名
+  // 从链接所在容器找真实文件名（**原样**，不做去标记/去扩展名）
   function nameOf(a){
     try{
       var box=null;
@@ -1130,96 +1131,27 @@ class MainActivity : AppCompatActivity() {
     }catch(e){ return ''; }
   }
 
-  // ---------- 命名脚本所需的变量与工具（与 Kotlin 侧保持等价） ----------
-
-  // 站点标记清理：域名一律去掉、**长的先删**、@ 当分隔符、只清空括号
-  // （等价于 DownloadHelper.stripSiteWatermark，改动时两处要同步）
-  var MARKS=['www.soushu2025.com','soushu2025.com','www.sxsy.org','sxsy.org','www.sxsy45.com','sxsy45.com'];
-  function escRe(s){ return s.replace(/\./g,'\\.'); }
-  function blank(){ return ' '; }
-  function stripMarks(s){
-    var low=String(s).toLowerCase(), hit=false;
-    for(var i=0;i<MARKS.length;i++){ if(low.indexOf(MARKS[i])>=0){ hit=true; break; } }
-    if(!hit) return s;
-    var x=String(s);
-    for(var j=0;j<MARKS.length;j++){
-      x=x.replace(new RegExp(escRe(MARKS[j]),'gi'), blank);
-    }
-    var prev='';
-    while(prev!==x){ prev=x; x=x.replace(/[\[\]【】（）()]\s*[\[\]【】（）()]/g,''); }
-    x=x.replace(/@/g,' ');
-    x=x.replace(/[\s:：_\-—·、,，]{2,}/g,' ');
-    x=x.replace(/([:：\/])\s+/g, blank);
-    x=x.replace(/\/{3,}/g,'//');
-    x=x.replace(/\s+/g,' ');
-    x=x.replace(/\s+(\.[A-Za-z0-9]{1,8})$/, blank);
-    return x.replace(/^[\s\-_.,，:：@]+/,'').replace(/[\s\-_.,，:：@]+$/,'').trim() || 'download';
-  }
-
-  // 从帖子标题提取 书名 / 章节（等价于 DownloadHelper.bookTitleOf）
-  function extractTitle(title){
-    var t=norm(title), out={book:'',chapter:''};
-    var i=t.indexOf('《');
-    if(i<0) return out;
-    var j=t.indexOf('》', i+1);
-    if(!(j>i+1)) return out;
-    var book=t.substring(i+1,j).trim();
-    if(!book) return out;
-    out.book=book;
-    var m=/[0-9０-９]{1,4}\s*[-–—－]\s*[0-9０-９]{1,4}/.exec(t.substring(j+1));
-    if(m){
-      var r='';
-      for(var k=0;k<m[0].length;k++){
-        var ch=m[0].charAt(k), cc=ch.charCodeAt(0);
-        if(cc>=0xFF10&&cc<=0xFF19) r+=String.fromCharCode(48+(cc-0xFF10));
-        else if(ch==='–'||ch==='—'||ch==='－') r+='-';
-        else if(/\s/.test(ch)) {}
-        else r+=ch;
-      }
-      out.chapter=r;
-    }
-    return out;
-  }
-
-  // 跑设置页里的命名脚本：new Function('v', src)，脚本里用 return 返回文件名
-  function runNaming(v){
-    try{
-      var f=new Function('v', '__USER_SRC__');
-      var r=f(v);
-      return (typeof r==='string') ? r.trim() : '';
-    }catch(e){ return ''; }
-  }
-
   function scan(){
     try{
       if(!window.DiscuzApp || !window.DiscuzApp.attachName) return;
-      var subj=document.getElementById('thread_subject');
-      var h1=document.querySelector('h1.ts');
-      var pageTitle=norm(subj?subj.textContent:(h1?h1.textContent:''));
-      var tinfo=extractTitle(pageTitle);
       var links=document.querySelectorAll(
         'a[href*="mod=attachment"],a[href*="attachment.php"],a[href*="action=attachpay"]');
+      var rows=0;
       for(var i=0;i<links.length;i++){
         var a=links[i], href=a.getAttribute('href')||'';
         if(!isFileLink(href)) continue;
         var id=auditOf(href);
         if(!id || reported[id]) continue;
-        var raw=nameOf(a);
-        if(!raw) continue;
-        reported[id]=1;
-        var v={
-          attach: stripMarks(raw),
-          attachRaw: raw,
-          title: pageTitle,
-          book: tinfo.book,
-          chapter: tinfo.chapter
-        };
-        var nm=runNaming(v);
-        // 脚本没给出名字（返回空或抛错）→ 回退到默认规则
-        if(!nm) nm = v.attach || (v.book ? v.book + (v.chapter ? '（'+v.chapter+'）' : '') : '');
+        var nm=nameOf(a);
         if(!nm) continue;
+        reported[id]=1;
+        rows++;
         try{ window.DiscuzApp.attachName(id, nm); }catch(e){}
       }
+      // 通知原生「附件名已就绪」：购买成功后的自动下载要等这一刻才触发。
+      // 以前是在 onPageFinished 里同步触发的，那时本脚本还没跑完（evaluateJavascript 异步），
+      // 名字表是空的 → 多附件帖全部退回帖子标题 → 存成同一个名字。
+      try{ if(window.DiscuzApp && window.DiscuzApp.attachNamesReady) window.DiscuzApp.attachNamesReady(rows); }catch(e){}
     }catch(e){}
   }
 
@@ -1244,64 +1176,10 @@ class MainActivity : AppCompatActivity() {
   else window.addEventListener('load', start);
 })();
 """.trimIndent()
-            .replace("__USER_SRC__", userSrc)
         webView.evaluateJavascript(js, null)
-        DebugLog.log("ATT", "已注入附件文件名上报脚本（命名脚本 ${userSrc.length} 字符）")
+        DebugLog.log("ATT", "已注入附件文件名上报脚本")
     }
 
-    /**
-     * 上报当前帖子的标题，下载命名按它取书名。
-     *
-     * 来源优先级：`#thread_subject`（官方模板 `forum/viewthread.php:202`，在 `<h1 class="ts">` 内）
-     * → `h1.ts` 的链接文字 → `<title>` 去掉站点后缀。
-     * 换页时原生侧会清空（见 `onPageStarted`），所以这里只在标题真的变化时才上报。
-     */
-    private fun injectThreadTitleJs() {
-        val js = """
-(function(){
-  if(window.__dzThreadTitle) return; window.__dzThreadTitle=1;
-  var last='';
-  function pick(){
-    var el=document.getElementById('thread_subject');
-    if(el){
-      var t=(el.textContent||'').replace(/\s|\u00a0/g,' ').trim();
-      if(t) return t;
-    }
-    var h=document.querySelector('h1.ts');
-    if(h){
-      var a=h.querySelector('a');
-      var t2=((a?a.textContent:h.textContent)||'').replace(/\s|\u00a0/g,' ').trim();
-      if(t2) return t2;
-    }
-    var tt=(document.title||'').replace(/\s|\u00a0/g,' ').trim();
-    if(tt) return tt.split(/\s+[-\u2013\u2014]\s+/)[0].trim();
-    return '';
-  }
-  function report(){
-    var t=pick();
-    if(!t || t===last) return;
-    last=t;
-    try{ if(window.DiscuzApp && window.DiscuzApp.threadTitle) window.DiscuzApp.threadTitle(t); }catch(e){}
-  }
-  report();
-  try{ window.addEventListener('load', report); }catch(e){}
-  // 标题可能是 AJAX 后补的：监听 DOM 变化，但只置脏、合并上报，且 8 秒后自动断开（不长期占用主线程）
-  var dirty=false, mo=null;
-  try{
-    mo=new MutationObserver(function(){ dirty=true; });
-    mo.observe(document.documentElement||document.body,{childList:true,subtree:true,characterData:true});
-  }catch(e){}
-  var iv=setInterval(function(){ if(dirty){ dirty=false; report(); } },400);
-  setTimeout(function(){
-    try{ if(mo){ mo.disconnect(); mo=null; } }catch(e){}
-    try{ clearInterval(iv); }catch(e){}
-    report();
-  },8000);
-})();
-""".trimIndent()
-        webView.evaluateJavascript(js, null)
-        DebugLog.log("TITLE", "已注入帖子标题上报脚本")
-    }
 
     /**
      * 用户自定义 JS 脚本（设置页「自定义脚本（JS）」）：每次页面加载完成后注入执行一次，空则不注入。
@@ -1784,13 +1662,29 @@ class MainActivity : AppCompatActivity() {
 
         /** JS 找到已生效的附件下载链接：直接交原生下载 */
         @JavascriptInterface
-        fun directDownload(url: String?) {
+        fun directDownload(url: String?, name: String?, aid: String?) {
             if (url.isNullOrBlank()) return
             if (!isTrustedJsUrl(url)) {
                 DebugLog.log("SEC", "拒绝非白名单下载调用: $url")
                 return
             }
+            // 多文件帖子必须**按附件身份**命名，不能靠"页面上随便找一个链接"。
+            // JS 定位链接时已经算好了这个附件的名字，一并带过来；
+            // aid 也带过来作为兜底键（购买后的下载 URL 里 aid 是 base64 签名，
+            // 万一解不出来还能按纯数字 id 从名字表里查）。
+            directNameHint = name?.trim()?.takeIf { it.isNotEmpty() && it.length <= 160 }
+            directAid = aid?.trim()?.takeIf { it.isNotEmpty() }
             runOnUiThread { onDownloadStart(url, null, null) }
+        }
+
+        /** 注入脚本扫完一轮附件名后的回调：用于等名字就绪再触发购买后的自动下载 */
+        @JavascriptInterface
+        fun attachNamesReady(count: Int) {
+            DebugLog.log("ATT", "附件名就绪：$count 个")
+            // 名字就绪后再触发「购买后自动下载」。以前是在 onPageFinished 里**同步**触发的，
+            // 那时注入脚本还没跑完（evaluateJavascript 异步 + load 事件 + 300ms 合并扫描），
+            // 名字表是空的 → 多附件帖子全部退回帖子标题 → 存成同一个名字。
+            if (pendingDownloadAid != null) runOnUiThread { tryAutoDownloadAfterBuy() }
         }
 
         @JavascriptInterface
@@ -1828,15 +1722,6 @@ class MainActivity : AppCompatActivity() {
             DebugLog.log("ATT", "附件名上报: $auditId -> $clean")
         }
 
-        /** 帖子标题上报（脚本从 `#thread_subject` 读出）；下载命名按它取《》内的书名 */
-        @JavascriptInterface
-        fun threadTitle(title: String?) {
-            if (title.isNullOrBlank()) return
-            val clean = title.replace(Regex("\\s+"), " ").trim().take(150)
-            if (clean.isEmpty()) return
-            currentThreadTitle = clean
-            DebugLog.log("TITLE", "帖子标题: $clean | 书名: ${DownloadHelper.bookTitleOf(clean)}")
-        }
 
         @JavascriptInterface
         fun fetchChunk(part: String?) {
@@ -1921,6 +1806,11 @@ class MainActivity : AppCompatActivity() {
     /** 浏览器通道本次下载的「帖子内文件名」（null = 没有名字，按普通流程处理） */
     private var fetchNameHint: String? = null
     private var fetchFileName: String = ""
+    /** tryAutoDownloadAfterBuy 的 JS 已经算好的文件名（只服务这一次下载，用完即清） */
+    @Volatile private var directNameHint: String? = null
+
+    /** 同上：这次下载对应的附件 id（纯数字），用于按身份从名字表兜底查 */
+    @Volatile private var directAid: String? = null
     /** 浏览器通道的临时文件：每块 base64 立刻解码追加到这里，fetchEnd 后落盘并删除 */
     private var fetchTemp: java.io.File? = null
     private var fetchSize: Long = 0L
@@ -2085,36 +1975,72 @@ class MainActivity : AppCompatActivity() {
     private fun tryAutoDownloadAfterBuy() {
         val aid = pendingDownloadAid ?: return
         pendingDownloadAid = null
-        // 已购买附件链接在帖子页里是 <span id="attach_<数字aid>"> 内的
-        // <a href="...mod=attachment&aid=<base64签名>">（aid 是 base64 加密，非数字）。
-        // 故用 attach_<数字aid> 容器定位，再取其中 mod=attachment 的下载链接。
+        // 已购买附件链接在帖子页里通常是 <span id="attach_<数字aid>"> 内的
+        // <a href="...mod=attachment&aid=<base64签名>">，也有直接给纯数字 aid 的。
+        // ⚠️ 绝不能「取页面上任意一个 mod=attachment 链接」——多附件帖子里那会下到**别的附件**，
+        //    而且拿到的是别人的文件名（实测多文件帖全部命名错误就是这个兜底造成的）。
+        // 所以这里统一用「把 href 里的 aid 解出来 == 目标 aid」来精确匹配，并把
+        // 同一个容器里读到的文件名一起回传（见 directDownload(url, name)）。
         val js = """
 (function(){
   var aid='$aid';
   var tries=0;
-  function pickLink(){
-    // 1) 精确：attach_<aid> 容器内的 mod=attachment 下载链接
-    var box=document.getElementById('attach_'+aid);
+  // 与注入脚本同一套 aid 解析：纯数字直接用，否则 base64 解码取第一段
+  function auditOf(href){
+    try{
+      var m=/[?&]aid=([^&#]+)/.exec(String(href||''));
+      if(!m) return '';
+      var raw=decodeURIComponent(m[1]).replace(/ /g,'+');
+      if(/^[0-9]+${'$'}/.test(raw)) return raw;
+      var txt='';
+      try{ txt=atob(raw); }catch(e){ return ''; }
+      return (txt.split('|')[0]||'').replace(/[^0-9A-Za-z]/g,'');
+    }catch(e){ return ''; }
+  }
+  function norm(s){ return String(s==null?'':s).replace(/ /g,' ').replace(/\s+/g,' ').trim(); }
+  function nameIn(a){
+    try{
+      var box=a.closest?a.closest('dl.tattl'):null;
+      var sp=box?box.querySelector('.attachname'):null;
+      var t=norm(sp?sp.textContent:'');
+      if(t && !/^(下载|附件|免费)$/.test(t)) return t;
+      var pn=box?box.querySelector('p.attnm a'):null;
+      if(pn){ var t2=norm(pn.textContent); if(t2 && /\.[A-Za-z0-9]{1,6}$/.test(t2)) return t2; }
+      var at=norm(a.textContent);
+      return at && !/^(下载|附件|免费)$/.test(at) ? at : '';
+    }catch(e){ return ''; }
+  }
+  function pick(){
+    var i,a,href,box;
+    // 1) 精确：attach_<aid> 容器内
+    box=document.getElementById('attach_'+aid);
     if(box){
-      var a=box.querySelector('a[href*="mod=attachment"]');
-      if(a){ var h=a.getAttribute('href')||''; if(h){ if(window.DiscuzApp) window.DiscuzApp.directDownload(h); return true; } }
+      a=box.querySelector('a[href*="mod=attachment"]');
+      if(a){ href=a.getAttribute('href')||''; if(href){ fire(href, nameIn(a)); return true; } }
     }
-    // 2) 兜底：页面上任意 mod=attachment 下载链接
-    var all=document.querySelectorAll('a[href*="mod=attachment"]');
-    for(var i=0;i<all.length;i++){
-      var href=all[i].getAttribute('href')||'';
-      if(href && href.indexOf('attachpay')<0){ if(window.DiscuzApp) window.DiscuzApp.directDownload(href); return true; }
+    // 2) 全页扫描：只认「解出来的 aid == 目标 aid」的链接，绝不拿别人的
+    var all=document.querySelectorAll('a[href*="mod=attachment"],a[href*="attachment.php"]');
+    for(i=0;i<all.length;i++){
+      a=all[i];
+      href=a.getAttribute('href')||'';
+      if(!href || /attachpay/i.test(href)) continue;
+      if(auditOf(href)===aid){ fire(href, nameIn(a)); return true; }
     }
     return false;
   }
+  function fire(href, name){
+    // 名称与附件 id 一起回传：多文件帖子里，名字必须跟「这一个附件」绑定，
+    // 不能出现「A 的文件用上B 的名字」的情况。
+    if(window.DiscuzApp && window.DiscuzApp.directDownload) window.DiscuzApp.directDownload(href, name||'', aid);
+  }
   function report(){
     var dump=[];
-    var any=document.querySelectorAll('a[href*="mod=attachment"]');
+    var any=document.querySelectorAll('a[href*="mod=attachment"],a[href*="attachment.php"]');
     for(var k=0;k<any.length && k<6;k++) dump.push(any[k].getAttribute('href')||'');
-    if(window.DiscuzApp) window.DiscuzApp.signNotice('未找到下载链接，请手动点附件。页内 attachment 链接: '+dump.join(' | '));
+    if(window.DiscuzApp) window.DiscuzApp.signNotice('未找到该附件的下载链接，请手动点。页内链接: '+dump.join(' | '));
   }
-  if(!pickLink()){
-    if(tries++ < 8){ setTimeout(function(){ if(!pickLink()){ if(tries>=8) report(); } }, 500); }
+  if(!pick()){
+    if(tries++ < 10){ setTimeout(function(){ if(!pick() && tries>=10) report(); }, 400); }
     else report();
   }
 })();
@@ -2193,12 +2119,25 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "请授予存储权限后重新点击下载", Toast.LENGTH_LONG).show()
             return
         }
-        // 文件名优先级：帖子内文件名（DOM 上报）→ 响应头 Content-Disposition → URL 兜底
-        val hint = preferredNameFor(httpUrl)
+        // 命名来源优先级（**按附件身份**，绝不退化到"页面上随便一个名字"）：
+        //  1) directNameHint —— tryAutoDownloadAfterBuy 的 JS 在定位到这个附件时算好的名字；
+        //  2) directAid → attachNames[aid] —— 同一次调用的附件 id，名字表兜底；
+        //  3) preferredNameFor(url) —— 从下载 URL 的 aid 反查名字表，再退回帖子标题规则。
+        val jsHint = directNameHint?.takeIf { it.isNotBlank() }
+        val jsAid = directAid?.takeIf { it.isNotBlank() }
+        directNameHint = null
+        directAid = null
+        val byAid = jsAid?.let { attachNames[it] }
+        val hint = jsHint ?: byAid ?: preferredNameFor(httpUrl)
         val fileName = try {
             DownloadHelper.resolveFileName(httpUrl, contentDisposition, hint)
         } catch (e: Exception) { "download_" + System.currentTimeMillis() }
-        DebugLog.log("DL", "开始原生下载: $httpUrl | mime=$mimeType | cd=$contentDisposition | hint=$hint | 命名=$fileName")
+        DebugLog.log(
+            "DL",
+            "开始原生下载: $httpUrl | mime=$mimeType | cd=$contentDisposition | " +
+                "名字来源=" + (if (jsHint != null) "JS直传" else if (byAid != null) "名字表(aid=$jsAid)" else "名表/标题(${attachNames.size}条)") +
+                " | aid=${auditIdOf(httpUrl) ?: "?"} | hint=$hint | 命名=$fileName"
+        )
         val nameDisplay = if (fileName.startsWith("download_")) "自动识别文件名" else fileName
         Toast.makeText(this, "开始下载：$nameDisplay", Toast.LENGTH_SHORT).show()
         DownloadHelper.start(

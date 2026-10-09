@@ -20,7 +20,6 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var etUrl: EditText
     private lateinit var etDownloadDir: EditText
     private lateinit var etCustomJs: EditText
-    private lateinit var etNameScript: EditText
     private lateinit var tvRetention: TextView
 
     // 历史记录保留时长选项（值 = 毫秒，0 = 不自动删除）
@@ -46,7 +45,6 @@ class SettingsActivity : AppCompatActivity() {
         etUrl = findViewById(R.id.etUrl)
         etDownloadDir = findViewById(R.id.etDownloadDir)
         etCustomJs = findViewById(R.id.etCustomJs)
-        etNameScript = findViewById(R.id.etNameScript)
         tvRetention = findViewById(R.id.tvRetention)
 
         // 回填当前配置（首次未配置时预填默认网址，用户确认后可保存）
@@ -54,7 +52,6 @@ class SettingsActivity : AppCompatActivity() {
         Prefs.setDesktopMode(this, true)
         etDownloadDir.setText(Prefs.getDownloadDir(this))
         etCustomJs.setText(Prefs.getCustomJs(this))
-        etNameScript.setText(Prefs.getNameScript(this).ifBlank { Prefs.defaultNameScript(this) })
         Prefs.setAdBlock(this, true)
         updateRetentionLabel()
 
@@ -62,17 +59,12 @@ class SettingsActivity : AppCompatActivity() {
         findViewById<MaterialButton>(R.id.btnSave).setOnClickListener { save() }
         findViewById<MaterialButton>(R.id.btnReset).setOnClickListener { onResetClicked() }
         findViewById<MaterialButton>(R.id.btnClearCache).setOnClickListener { confirmClearCache() }
-        findViewById<MaterialButton>(R.id.btnImportScript).setOnClickListener { pickScriptFile(etCustomJs) }
+        findViewById<MaterialButton>(R.id.btnImportScript).setOnClickListener { pickScriptFile() }
         findViewById<MaterialButton>(R.id.btnClearScript).setOnClickListener { clearScript() }
-        findViewById<MaterialButton>(R.id.btnImportNameScript).setOnClickListener { pickScriptFile(etNameScript) }
-        findViewById<MaterialButton>(R.id.btnResetNameScript).setOnClickListener { resetNameScript() }
         findViewById<View>(R.id.retentionRow).setOnClickListener { chooseRetention() }
     }
 
     // —— 导入本地脚本 ——
-
-    /** 本次导入要填到哪个输入框（点哪个「导入」按钮就填哪个） */
-    private var importTarget: EditText? = null
 
     /**
      * 系统文件选择器挑一个脚本文件。
@@ -90,11 +82,10 @@ class SettingsActivity : AppCompatActivity() {
             Toast.makeText(this, "该文件是空的", Toast.LENGTH_SHORT).show()
             return@registerForActivityResult
         }
-        val target = importTarget ?: etCustomJs
         // 已有内容时让用户选「追加」还是「替换」，避免误覆盖正在用的脚本
-        val current = target.text.toString()
+        val current = etCustomJs.text.toString()
         if (current.isBlank()) {
-            target.setText(text)
+            etCustomJs.setText(text)
             Toast.makeText(this, "已导入 ${text.length} 字符", Toast.LENGTH_SHORT).show()
             return@registerForActivityResult
         }
@@ -102,10 +93,10 @@ class SettingsActivity : AppCompatActivity() {
             .setTitle("已有 ${current.length} 字符脚本，如何处理？")
             .setItems(arrayOf("追加到末尾", "替换全部")) { _, which ->
                 if (which == 0) {
-                    target.setText(current.trimEnd() + "\n\n" + text)
+                    etCustomJs.setText(current.trimEnd() + "\n\n" + text)
                     Toast.makeText(this, "已追加 ${text.length} 字符", Toast.LENGTH_SHORT).show()
                 } else {
-                    target.setText(text)
+                    etCustomJs.setText(text)
                     Toast.makeText(this, "已替换为 ${text.length} 字符", Toast.LENGTH_SHORT).show()
                 }
             }
@@ -113,8 +104,7 @@ class SettingsActivity : AppCompatActivity() {
             .show()
     }
 
-    private fun pickScriptFile(target: EditText) {
-        importTarget = target
+    private fun pickScriptFile() {
         try {
             pickScript.launch(arrayOf("*/*"))
         } catch (e: Exception) {
@@ -122,11 +112,6 @@ class SettingsActivity : AppCompatActivity() {
         }
     }
 
-    /** 把命名脚本恢复成 assets/name_rules.js 里的默认内容（尚未保存，点「保存设置」才生效） */
-    private fun resetNameScript() {
-        etNameScript.setText(Prefs.defaultNameScript(this))
-        Toast.makeText(this, "已恢复默认脚本（记得点「保存设置」生效）", Toast.LENGTH_SHORT).show()
-    }
 
     /**
      * 读脚本文本：优先 UTF-8；出现替换符说明不是 UTF-8，再按 GBK 试一次
@@ -244,7 +229,6 @@ class SettingsActivity : AppCompatActivity() {
         Prefs.setDesktopMode(this, true)
         Prefs.setDownloadDir(this, etDownloadDir.text.toString().trim().ifBlank { "尚香书院" })
         Prefs.setCustomJs(this, etCustomJs.text.toString())
-        Prefs.setNameScript(this, etNameScript.text.toString())
         Prefs.setAdBlock(this, true)
         Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show()
         finish()
@@ -256,8 +240,6 @@ class SettingsActivity : AppCompatActivity() {
         etDownloadDir.setText("尚香书院")
         etCustomJs.setText("")
         Prefs.setCustomJs(this, "")
-        etNameScript.setText(Prefs.defaultNameScript(this))
-        Prefs.setNameScript(this, "")
         Prefs.setAdBlock(this, true)
         Toast.makeText(this, "已恢复默认（未保存）", Toast.LENGTH_SHORT).show()
     }
