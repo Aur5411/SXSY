@@ -1,5 +1,6 @@
 package com.sxsy45.app
 
+import android.net.Uri
 import android.os.Bundle
 import android.view.View
 import android.webkit.CookieManager
@@ -8,9 +9,11 @@ import android.webkit.WebViewDatabase
 import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.button.MaterialButton
+import java.nio.charset.Charset
 
 class SettingsActivity : AppCompatActivity() {
 
@@ -56,7 +59,84 @@ class SettingsActivity : AppCompatActivity() {
         findViewById<MaterialButton>(R.id.btnSave).setOnClickListener { save() }
         findViewById<MaterialButton>(R.id.btnReset).setOnClickListener { onResetClicked() }
         findViewById<MaterialButton>(R.id.btnClearCache).setOnClickListener { confirmClearCache() }
+        findViewById<MaterialButton>(R.id.btnImportScript).setOnClickListener { pickScriptFile() }
+        findViewById<MaterialButton>(R.id.btnClearScript).setOnClickListener { clearScript() }
         findViewById<View>(R.id.retentionRow).setOnClickListener { chooseRetention() }
+    }
+
+    // —— 导入本地脚本 ——
+
+    /**
+     * 系统文件选择器挑一个脚本文件。
+     *
+     * MIME 传通配符（星号斜杠星号）而不是 `text/javascript`：不少系统把 `.user.js`
+     * 归类成 octet-stream 或 application/json，限定类型会导致「明明有脚本却选不到」。
+     */
+    private val pickScript = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@registerForActivityResult
+        val text = readTextFile(uri) ?: run {
+            Toast.makeText(this, "读取失败：文件不可读或已移动", Toast.LENGTH_SHORT).show()
+            return@registerForActivityResult
+        }
+        if (text.isBlank()) {
+            Toast.makeText(this, "该文件是空的", Toast.LENGTH_SHORT).show()
+            return@registerForActivityResult
+        }
+        // 已有内容时让用户选「追加」还是「替换」，避免误覆盖正在用的脚本
+        val current = etCustomJs.text.toString()
+        if (current.isBlank()) {
+            etCustomJs.setText(text)
+            Toast.makeText(this, "已导入 ${text.length} 字符", Toast.LENGTH_SHORT).show()
+            return@registerForActivityResult
+        }
+        AlertDialog.Builder(this)
+            .setTitle("已有 ${current.length} 字符脚本，如何处理？")
+            .setItems(arrayOf("追加到末尾", "替换全部")) { _, which ->
+                if (which == 0) {
+                    etCustomJs.setText(current.trimEnd() + "\n\n" + text)
+                    Toast.makeText(this, "已追加 ${text.length} 字符", Toast.LENGTH_SHORT).show()
+                } else {
+                    etCustomJs.setText(text)
+                    Toast.makeText(this, "已替换为 ${text.length} 字符", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun pickScriptFile() {
+        try {
+            pickScript.launch(arrayOf("*/*"))
+        } catch (e: Exception) {
+            Toast.makeText(this, "无法打开文件选择器：${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    /**
+     * 读脚本文本：优先 UTF-8；出现替换符说明不是 UTF-8，再按 GBK 试一次
+     * （中文论坛里存成 GBK 的 .js 很常见，直接按 UTF-8 解会变成一堆�）。
+     */
+    private fun readTextFile(uri: Uri): String? {
+        val bytes = try {
+            contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return null
+        } catch (e: Exception) {
+            return null
+        }
+        val utf8 = String(bytes, Charsets.UTF_8)
+        if (!utf8.contains('\uFFFD')) return utf8
+        val gbk = try {
+            String(bytes, Charset.forName("GBK"))
+        } catch (e: Exception) { null }
+        return if (gbk != null && !gbk.contains('\uFFFD')) gbk else utf8
+    }
+
+    private fun clearScript() {
+        if (etCustomJs.text.isNullOrBlank()) {
+            Toast.makeText(this, "脚本已经是空的", Toast.LENGTH_SHORT).show()
+            return
+        }
+        etCustomJs.setText("")
+        Toast.makeText(this, "已清空脚本（记得点「保存设置」生效）", Toast.LENGTH_SHORT).show()
     }
 
     // —— 连击「重置」按钮弹出诊断功能控制 ——

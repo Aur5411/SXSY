@@ -90,15 +90,19 @@ object DownloadHelper {
      *     `【阳光正好儿媳苏钥】（加料版）.txt` → `阳光正好儿媳苏钥】（加料版）.txt`（首字丢失、留孤儿右括号）。
      *
      * 所以这里只在 nameHint **本身确实含 U+FFFD 或典型乱码特征**（说明上游就已经坏了）时才尝试修复。
+     *
+     * 另外：nameHint 无论来自帖子标题（经 [bookTitleOf] 取书名号）还是帖子内附件名，
+     * 最后都会过一遍 [stripSiteWatermark] —— 文件名里只要出现站点标记（sxsy.org 等）就一律去掉。
      */
     fun resolveFileName(url: String, contentDisposition: String?, nameHint: String? = null): String {
-        // 0. 最高优先级：帖子内显示的文件名
+        // 0. 最高优先级：帖子标题（书名号内）或帖子内附件名
         if (!nameHint.isNullOrBlank()) {
             val raw = nameHint.trim()
             val needsRepair = raw.contains('\uFFFD') || looksMojibake(raw)
-            val cleaned = (if (needsRepair) fixEncoding(raw) else raw)
+            var cleaned = (if (needsRepair) fixEncoding(raw) else raw)
                 .replace(Regex("[\\\\/:*?\"<>|\\uFFFD]"), "_")
                 .trim()
+            cleaned = stripSiteWatermark(cleaned)
             if (cleaned.isNotBlank() && !looksLikeScriptOrGenericPage(cleaned)) {
                 return cleaned
             }
@@ -351,6 +355,67 @@ object DownloadHelper {
             .trim(' ', '-', '_', '[', ']', '(', ')', '【', '】', '（', '）', '@', ',', '，')
         if (b.isBlank()) b = base
         return b + ext
+    }
+
+    /**
+     * 站点水印标记：本项目实际在用的域名。
+     *
+     * 与 [stripWebsite] 的区别是「**一律去掉**」：
+     *  - [stripWebsite] 只剥**前缀**（或把中间的域名换成空格），且剥完只剩空白时会还原成原名；
+     *  - 这里只要在文件名**任何位置**看到这些域名，就一定清掉，不留还原分支。
+     * 没有出现这些标记时**一个字都不改**（避免破坏 `【书名】（加料版）` 这类带装饰括号的原名）。
+     */
+    private val SITE_MARKS = listOf(
+        "sxsy.org", "www.sxsy.org", "sxsy45.com", "www.sxsy45.com"
+    )
+
+    /** 文件名里识别到站点标记就一律去掉；没有标记则原样返回。 */
+    fun stripSiteWatermark(name: String): String {
+        if (SITE_MARKS.none { name.contains(it, ignoreCase = true) }) return name
+        var s = name
+        // **必须长的先删**：否则 `www.sxsy.org` 会被 `sxsy.org` 先吃掉前半截，
+        // 剩下一个孤零零的 `www` 粘在名字里（实测 `书名 [www.sxsy.org]` → `书名 www`）。
+        for (m in SITE_MARKS.sortedByDescending { it.length }) {
+            s = s.replace(m, " ", ignoreCase = true)
+        }
+        // 只清「空括号」：标记删掉后剩下的 `[]` `【】` 要去掉，
+        // 但 （加料版）这种**有内容的**括号必须保留（不能一股脑把括号全删）。
+        var prev = ""
+        while (prev != s) {
+            prev = s
+            s = s.replace(Regex("[\\[\\]【】（）()]\\s*[\\[\\]【】（）()]"), "")
+        }
+        // 收拾分隔符：连续符号收成一个空格；冒号/斜杠后的空格与扩展名前的空格去掉
+        // （否则 `书名sxsy.org.txt` 会变成 `书名 .txt`）
+        s = s.replace(Regex("[\\s:：_\\-—·、,，]{2,}"), " ")
+            .replace(Regex("([:：/])\\s+"), "$1")
+            .replace(Regex("/{3,}"), "//")
+            .replace(Regex("\\s+"), " ")
+            .replace(Regex("\\s+(\\.[A-Za-z0-9]{1,8})$"), "$1")
+            .trim(' ', '-', '_', '.', ',', '，', ':', '：')
+        // 万一剥完什么都没有（例如文件名就是域名），给个中性兜底名，别把域名还回去
+        return s.ifBlank { "download" }
+    }
+
+    /**
+     * 取帖子标题里的**书名号内容**；没有书名号就返回标题本身。
+     *
+     * 「只取书名号内」——书名号外的前缀/后缀（如 `[完结] 《书名》 （全本）`）一律丢弃。
+     * 只认 `《》` 一种书名号（按需求指定）；`〈〉「」『』` 这类不认，
+     * `【】` 更不认——这类论坛的 【】 常是「[完结]」「[VIP]」这类前缀标签而非书名号，取内层会得到标签。
+     */
+    fun bookTitleOf(title: String): String {
+        val t = title.replace('\u00A0', ' ').replace(Regex("\\s+"), " ").trim()
+        if (t.isEmpty()) return ""
+        val i = t.indexOf('《')
+        if (i >= 0) {
+            val j = t.indexOf('》', i + 1)
+            if (j > i + 1) {
+                val inner = t.substring(i + 1, j).trim()
+                if (inner.isNotBlank()) return inner
+            }
+        }
+        return t
     }
 
     /** 按 MIME 猜扩展名（公开：浏览器通道保存时也用） */
@@ -943,11 +1008,13 @@ object DownloadHelper {
     )
 
     private fun normalizeSavedFileName(fileName: String, fileType: FileType, preserveName: Boolean = false): String {
-        // preserveName：名字来自帖子内 attachname —— **原样保留**。
+        // 一律去掉站点标记（sxsy.org / sxsy45.com 等）：不管名字来自帖子标题、附件名还是响应头
+        val nameIn = stripSiteWatermark(fileName)
+        // preserveName：名字来自帖子标题（书名号内）或帖子内 attachname —— **原样保留**。
         // 不剥站点标记（stripWebsite 会把书名自带的【】剥掉）、不做多编码猜测（会把正常中文解码坏），
         // 只在帖子里的名字**确实缺扩展名**时，按文件真实类型补一个后缀，主体一字不改。
         if (preserveName) {
-            val safe = fileName
+            val safe = nameIn
                 .replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001F\\uFFFD]"), "_")
                 .trim()
             if (safe.isNotBlank()) {
@@ -962,7 +1029,7 @@ object DownloadHelper {
         // 只做两件事：清理非法字符、去掉文件名前面的站点标记。
         // 注意 stripWebsite 必须在「含扩展名的完整名」上调用——它靠最后一个点拆 base/ext，
         // 若先拆掉扩展名再传进去，站点域名里的点会被当成扩展名分隔点，前缀就剥不掉了。
-        var safe = fileName
+        var safe = nameIn
             .replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001F\\uFFFD]"), "_")
             .trim()
         val stripped = stripWebsite(safe)

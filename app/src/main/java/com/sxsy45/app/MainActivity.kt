@@ -65,6 +65,7 @@ import java.io.ByteArrayInputStream
  *  - injectAdBlock()      弹窗广告屏蔽（popadv 插件 + Discuz fwin_ 广告浮层兜底）
  *  - injectFirstPostImages() 1 楼楼主发布的图片可直接查看（被站点降级成链接的图片附件还原成内联图）
  *  - injectAttachNameJs() 读取帖子内附件真实文件名并上报，用于下载时保留原名
+ *  - injectThreadTitleJs() 读取帖子标题（`#thread_subject`）上报，下载命名按《》取书名
  *  - injectForumCleanup() 摘掉外链推广分区 + 残留广告节点（规则见 AdBlocker.kt）
  *  - injectAutoSign()     每日签到自动完成
  *  - injectAttachPayHook() 付费附件自动购买/下载挂钩
@@ -307,6 +308,8 @@ class MainActivity : AppCompatActivity() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 progressBar.visibility = View.VISIBLE
                 if (url != null && !isDownloadCandidate(url)) lastContentPageUrl = url
+                // 换页即清空上一帖的标题：否则在列表页点附件会拿上一帖的标题当文件名
+                currentThreadTitle = null
                 DebugLog.log("PAGE", "加载开始: $url")
             }
 
@@ -318,6 +321,7 @@ class MainActivity : AppCompatActivity() {
                 injectAdBlock()
                 injectFirstPostImages()
                 injectAttachNameJs()
+                injectThreadTitleJs()
                 injectForumCleanup()
                 injectAutoSign()
                 injectAttachPayHook()
@@ -489,7 +493,7 @@ class MainActivity : AppCompatActivity() {
                         DebugLog.log("INTERCEPT", "重复请求，跳过: $url")
                         null
                     } else {
-                        val hint = nameHintForUrl(p.finalUrl)
+                        val hint = preferredNameFor(p.finalUrl)
                         val name = DownloadHelper.resolveFileName(p.finalUrl, p.disposition, hint)
                         val savedName = DownloadHelper.saveFromFile(this@MainActivity, p.file, name, !hint.isNullOrBlank())
                         p.file.delete()
@@ -963,6 +967,12 @@ class MainActivity : AppCompatActivity() {
     private val attachNames = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     /**
+     * 当前帖子的标题（由 [injectThreadTitleJs] 从 `#thread_subject` 上报）。
+     * 下载命名时按它取书名号内的书名；换页时清空（见 `onPageStarted`）。
+     */
+    @Volatile private var currentThreadTitle: String? = null
+
+    /**
      * 从附件下载 URL 求「附件 id」（与注入脚本 auditOf 同一套规则）：
      * `?aid=<urlencode(base64)>` 解码后形如 `4563314|61f7b6c2|…`，取 `|` 前第一段；
      * aid 本身是纯数字时直接用。
@@ -985,10 +995,29 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) { null }
     }
 
-    /** 查附件 URL 对应的「帖子内文件名」，查不到返回 null（下载链路据此决定是否原样保留） */
+    /** 查附件 URL 对应的「帖子内文件名」，查不到返回 null */
     private fun nameHintForUrl(url: String?): String? {
         val id = auditIdOf(url) ?: return null
         return attachNames[id]
+    }
+
+    /**
+     * 下载文件名基准：**帖子标题优先，其次帖子内附件名**。
+     *
+     * 规则（按需求）：
+     *  1. 有帖子标题 → 取 `《》` 内的书名；标题里没有书名号就用标题本身；
+     *  2. 没有帖子标题（在列表页等非帖子页触发）→ 退回帖子内的附件真实名；
+     *  3. 都没有 → null，交给响应头 / URL 兜底。
+     *
+     * 站点标记（sxsy.org 等）在 [DownloadHelper.stripSiteWatermark] 里一律去掉。
+     */
+    private fun preferredNameFor(url: String?): String? {
+        val t = currentThreadTitle
+        if (!t.isNullOrBlank()) {
+            val base = DownloadHelper.bookTitleOf(t)
+            if (base.isNotBlank()) return base
+        }
+        return nameHintForUrl(url)
     }
 
     /**
@@ -1111,6 +1140,60 @@ class MainActivity : AppCompatActivity() {
 """.trimIndent()
         webView.evaluateJavascript(js, null)
         DebugLog.log("ATT", "已注入附件文件名上报脚本")
+    }
+
+    /**
+     * 上报当前帖子的标题，下载命名按它取书名。
+     *
+     * 来源优先级：`#thread_subject`（官方模板 `forum/viewthread.php:202`，在 `<h1 class="ts">` 内）
+     * → `h1.ts` 的链接文字 → `<title>` 去掉站点后缀。
+     * 换页时原生侧会清空（见 `onPageStarted`），所以这里只在标题真的变化时才上报。
+     */
+    private fun injectThreadTitleJs() {
+        val js = """
+(function(){
+  if(window.__dzThreadTitle) return; window.__dzThreadTitle=1;
+  var last='';
+  function pick(){
+    var el=document.getElementById('thread_subject');
+    if(el){
+      var t=(el.textContent||'').replace(/\s|\u00a0/g,' ').trim();
+      if(t) return t;
+    }
+    var h=document.querySelector('h1.ts');
+    if(h){
+      var a=h.querySelector('a');
+      var t2=((a?a.textContent:h.textContent)||'').replace(/\s|\u00a0/g,' ').trim();
+      if(t2) return t2;
+    }
+    var tt=(document.title||'').replace(/\s|\u00a0/g,' ').trim();
+    if(tt) return tt.split(/\s+[-\u2013\u2014]\s+/)[0].trim();
+    return '';
+  }
+  function report(){
+    var t=pick();
+    if(!t || t===last) return;
+    last=t;
+    try{ if(window.DiscuzApp && window.DiscuzApp.threadTitle) window.DiscuzApp.threadTitle(t); }catch(e){}
+  }
+  report();
+  try{ window.addEventListener('load', report); }catch(e){}
+  // 标题可能是 AJAX 后补的：监听 DOM 变化，但只置脏、合并上报，且 8 秒后自动断开（不长期占用主线程）
+  var dirty=false, mo=null;
+  try{
+    mo=new MutationObserver(function(){ dirty=true; });
+    mo.observe(document.documentElement||document.body,{childList:true,subtree:true,characterData:true});
+  }catch(e){}
+  var iv=setInterval(function(){ if(dirty){ dirty=false; report(); } },400);
+  setTimeout(function(){
+    try{ if(mo){ mo.disconnect(); mo=null; } }catch(e){}
+    try{ clearInterval(iv); }catch(e){}
+    report();
+  },8000);
+})();
+""".trimIndent()
+        webView.evaluateJavascript(js, null)
+        DebugLog.log("TITLE", "已注入帖子标题上报脚本")
     }
 
     /**
@@ -1606,7 +1689,7 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun fetchBegin(cd: String?, mime: String?) {
             val u = pendingFetchUrl ?: return
-            fetchNameHint = nameHintForUrl(u)
+            fetchNameHint = preferredNameFor(u)
             fetchFileName = try {
                 DownloadHelper.resolveFileName(u, if (cd.isNullOrBlank()) null else cd, fetchNameHint)
             } catch (e: Exception) { "download_" + System.currentTimeMillis() }
@@ -1625,6 +1708,16 @@ class MainActivity : AppCompatActivity() {
             if (clean.isEmpty() || clean.length > 120) return
             attachNames[auditId.trim()] = clean
             DebugLog.log("ATT", "附件名上报: $auditId -> $clean")
+        }
+
+        /** 帖子标题上报（脚本从 `#thread_subject` 读出）；下载命名按它取《》内的书名 */
+        @JavascriptInterface
+        fun threadTitle(title: String?) {
+            if (title.isNullOrBlank()) return
+            val clean = title.replace(Regex("\\s+"), " ").trim().take(150)
+            if (clean.isEmpty()) return
+            currentThreadTitle = clean
+            DebugLog.log("TITLE", "帖子标题: $clean | 书名: ${DownloadHelper.bookTitleOf(clean)}")
         }
 
         @JavascriptInterface
@@ -1947,7 +2040,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         // 文件名优先级：帖子内文件名（DOM 上报）→ 响应头 Content-Disposition → URL 兜底
-        val hint = nameHintForUrl(httpUrl)
+        val hint = preferredNameFor(httpUrl)
         val fileName = try {
             DownloadHelper.resolveFileName(httpUrl, contentDisposition, hint)
         } catch (e: Exception) { "download_" + System.currentTimeMillis() }
