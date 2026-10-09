@@ -360,13 +360,18 @@ object DownloadHelper {
     /**
      * 站点水印标记：本项目实际在用的域名。
      *
+     * 全部来自真实附件名实测（`sxsy45.com` 抓包）：
+     * `[sxsy.org]soushu2025.com@陪读母亲的性事 1-12….txt` —— 一个文件名里能同时出现两个标记，
+     * 且第二个还带 `@` 分隔符，所以 `@` 也一并当分隔符清掉。
+     *
      * 与 [stripWebsite] 的区别是「**一律去掉**」：
      *  - [stripWebsite] 只剥**前缀**（或把中间的域名换成空格），且剥完只剩空白时会还原成原名；
      *  - 这里只要在文件名**任何位置**看到这些域名，就一定清掉，不留还原分支。
      * 没有出现这些标记时**一个字都不改**（避免破坏 `【书名】（加料版）` 这类带装饰括号的原名）。
      */
     private val SITE_MARKS = listOf(
-        "sxsy.org", "www.sxsy.org", "sxsy45.com", "www.sxsy45.com"
+        "sxsy.org", "www.sxsy.org", "sxsy45.com", "www.sxsy45.com",
+        "soushu2025.com", "www.soushu2025.com"
     )
 
     /** 文件名里识别到站点标记就一律去掉；没有标记则原样返回。 */
@@ -385,14 +390,16 @@ object DownloadHelper {
             prev = s
             s = s.replace(Regex("[\\[\\]【】（）()]\\s*[\\[\\]【】（）()]"), "")
         }
-        // 收拾分隔符：连续符号收成一个空格；冒号/斜杠后的空格与扩展名前的空格去掉
+        // 收拾分隔符：`@` 是实测里域名与书名之间的分隔符（`soushu2025.com@书名`），一并清掉；
+        // 连续符号收成一个空格；冒号/斜杠后的空格与扩展名前的空格去掉
         // （否则 `书名sxsy.org.txt` 会变成 `书名 .txt`）
-        s = s.replace(Regex("[\\s:：_\\-—·、,，]{2,}"), " ")
+        s = s.replace("@", " ")
+            .replace(Regex("[\\s:：_\\-—·、,，]{2,}"), " ")
             .replace(Regex("([:：/])\\s+"), "$1")
             .replace(Regex("/{3,}"), "//")
             .replace(Regex("\\s+"), " ")
             .replace(Regex("\\s+(\\.[A-Za-z0-9]{1,8})$"), "$1")
-            .trim(' ', '-', '_', '.', ',', '，', ':', '：')
+            .trim(' ', '-', '_', '.', ',', '，', ':', '：', '@')
         // 万一剥完什么都没有（例如文件名就是域名），给个中性兜底名，别把域名还回去
         return s.ifBlank { "download" }
     }
@@ -679,7 +686,9 @@ object DownloadHelper {
             setRequestProperty("Sec-Fetch-Site", "same-origin")
             setRequestProperty("Sec-Fetch-User", "?1")
             connectTimeout = 15000
-            readTimeout = 60000
+            // 读超时放到 3 分钟：慢速网络下大文件（TXT 动辄十几 MB）传输中会有较长间隔，
+            // 60 秒太紧，容易在文件还没下完时抛 SocketTimeoutException。
+            readTimeout = 180000
             instanceFollowRedirects = false // 手动跟随，保证每跳都带 Cookie 与 Referer
         }
     }

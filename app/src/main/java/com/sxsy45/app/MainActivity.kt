@@ -1002,38 +1002,47 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 下载文件名基准：**帖子标题优先，其次帖子内附件名**。
+     * 下载文件名基准：**附件原名优先，拿不到才用帖子标题**。
      *
-     * 规则（按需求）：
-     *  1. 有帖子标题 → 取 `《》` 内的书名；标题里没有书名号就用标题本身；
-     *  2. 没有帖子标题（在列表页等非帖子页触发）→ 退回帖子内的附件真实名；
-     *  3. 都没有 → null，交给响应头 / URL 兜底。
+     * 真实站点数据（`sxsy45.com`，抓了 3 个帖子页实测）：
+     * - 单文件小说帖：附件名 `淫童降世之从淫荡骚母开始(1-11).txt`，比标题推导更贴切；
+     * - 多文件求书帖（18 个附件散在 10 个楼层里）：标题是「求书，绿母+乱…」这种**描述**，
+     *   根本不是书名，若按标题命名会让 18 个文件全部同名、互相覆盖。
      *
-     * 站点标记（sxsy.org 等）在 [DownloadHelper.stripSiteWatermark] 里一律去掉。
+     * 所以顺序是：附件原名 → 帖子标题（`《》` 取书名 + `-` 取章节，见 [DownloadHelper.bookTitleOf]）
+     * → 响应头 → URL。附件名仍会过 [DownloadHelper.stripSiteWatermark] 去掉站点标记。
      */
     private fun preferredNameFor(url: String?): String? {
+        nameHintForUrl(url)?.let { return it }
         val t = currentThreadTitle
         if (!t.isNullOrBlank()) {
             val base = DownloadHelper.bookTitleOf(t)
             if (base.isNotBlank()) return base
         }
-        return nameHintForUrl(url)
+        return null
     }
 
     /**
-     * 上报帖子内附件的真实文件名。
+     * 上报帖子内附件的**原文件名**（下载命名第一优先级）。
      *
-     * Discuz 帖子页附件块结构为
+     * 站点实测有两种附件块形态（`sxsy45.com`）：
      * ```
-     * <dl class="tattl"><dd>
-     *   <p class="mbn"><span class="attachname">1.jpg</span><span class="y">免费</span></p>
-     *   <p class="buttons"><a href="forum.php?mod=attachment&aid=<base64>&nothumb=yes"
-     *      id="aid4563314" class="xw1 btn_download">下载</a></p>
+     * ① 标准模板（搜书吧那种）：
+     * <dl class="tattl"><dd><p class="mbn"><span class="attachname">1.jpg</span></p>
+     *   <a href="forum.php?mod=attachment&aid=<base64>">下载</a></dd></dl>
+     *
+     * ② 尚香书苑（实测 18 个附件全是这种，**没有 .attachname**，且都是付费附件）：
+     * <dl class="tattl"><dt><img class="vm"></dt><dd>
+     *   <p class="attnm"><a href="forum.php?mod=misc&amp;action=attachpay&amp;aid=631539&amp;tid=327909"
+     *      onclick="showWindow('attachpay', this.href)">[sxsy.org]soushu2025.com@陪读母亲的性事 1-12….txt</a></p>
+     *   <p>售价: <strong>1 金钱</strong> … [<a …action=viewattachpayments…>记录</a>] [<a …attachpay…>购买</a>]</p>
      * </dd></dl>
      * ```
-     * —— 真实名字在 `<span class="attachname">` 里，而下载链接文字固定是「下载」。
+     * 形态 ② 里**真实文件名就是 `<a>` 的链接文字**，且链接是 `action=attachpay`（付费购买入口，
+     * 点它会走 App 自己的 `handleAttachPay` 购买流程）—— 所以**不能跳过 attachpay**，
+     * 否则一个文件名都拿不到；真正要跳过的只有 `viewattachpayments`（那个是「记录」）。
      *
-     * 上报键用附件 id：`aid` 是 URL 编码的 base64，解码后第一段就是附件 id。
+     * 上报键用附件 id：尚香是纯数字 `aid=631539`，搜书吧是 base64，两种都支持（见 [auditIdOf]）。
      */
     private fun injectAttachNameJs() {
         val js = """
@@ -1043,12 +1052,20 @@ class MainActivity : AppCompatActivity() {
 
   function norm(s){ return String(s==null?'':s).replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim(); }
 
-  // 通用占位文字（不是文件名）
+  // 通用占位文字（不是文件名）：下载/购买/记录/免费…
   function isGeneric(t){
-    return !t || /^(下载|附件|立即下载|点击下载|点击这里下载|重新下载|免费|download|attach|attachment)$/i.test(t);
+    return !t || /^(下载|附件|立即下载|点击下载|点击这里下载|重新下载|免费|购买|记录|查看|下载附件|点击文件名下载附件|download|attach|attachment)$/i.test(t);
   }
 
-  // 从 href 求 Discuz 附件 id
+  // 文件链接判定：mod=attachment / attachment.php / 付费购买 action=attachpay
+  // 排除 action=viewattachpayments（那是「记录」页，不是文件）
+  function isFileLink(href){
+    if(!href) return false;
+    if(/viewattachpayments/i.test(href)) return false;
+    return /mod=attachment/i.test(href) || /attachment\.php/i.test(href) || /action=attachpay/i.test(href);
+  }
+
+  // 从 href 求 Discuz 附件 id（纯数字 aid，或 base64 解码后取第一段）
   function auditOf(href){
     try{
       var m=/[?&]aid=([^&#]+)/.exec(String(href||''));
@@ -1080,12 +1097,18 @@ class MainActivity : AppCompatActivity() {
         }
       }
       if(box){
-        // 主路径：Discuz 标准模板的 <span class="attachname">真实文件名</span>
+        // ① 标准模板：<span class="attachname">真实文件名</span>
         var sp=box.querySelector('.attachname');
         var t=norm(sp? sp.textContent : '');
         if(!isGeneric(t)) return t;
-        // 兜底：容器 dd / .mbn 内首个「像文件名」的文本（含扩展名）
-        var cands=box.querySelectorAll('dd,p,.mbn');
+        // ② 尚香书苑形态：<p class="attnm"><a>真实文件名</a></p> —— 文件名就是链接文字
+        var pn=box.querySelector('p.attnm a');
+        if(pn){
+          var t2=norm(pn.textContent);
+          if(!isGeneric(t2) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(t2)) return t2;
+        }
+        // 兜底：容器 dd / .mbn / .attnm 内首个「像文件名」的文本（含扩展名）
+        var cands=box.querySelectorAll('dd,p,.mbn,.attnm');
         for(var i=0;i<cands.length;i++){
           var x=norm(cands[i].textContent);
           if(!isGeneric(x) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(x)) return x;
@@ -1103,10 +1126,11 @@ class MainActivity : AppCompatActivity() {
   function scan(){
     try{
       if(!window.DiscuzApp || !window.DiscuzApp.attachName) return;
-      var links=document.querySelectorAll('a[href*="mod=attachment"],a[href*="attachment.php"]');
+      var links=document.querySelectorAll(
+        'a[href*="mod=attachment"],a[href*="attachment.php"],a[href*="action=attachpay"]');
       for(var i=0;i<links.length;i++){
         var a=links[i], href=a.getAttribute('href')||'';
-        if(/attachpay/i.test(href)) continue;         // 付费购买浮层，不是文件
+        if(!isFileLink(href)) continue;
         var id=auditOf(href);
         if(!id || reported[id]) continue;
         var nm=nameOf(a);
@@ -1693,12 +1717,23 @@ class MainActivity : AppCompatActivity() {
             fetchFileName = try {
                 DownloadHelper.resolveFileName(u, if (cd.isNullOrBlank()) null else cd, fetchNameHint)
             } catch (e: Exception) { "download_" + System.currentTimeMillis() }
-            fetchB64.setLength(0)
-            DebugLog.log("FETCH", "浏览器通道命名: $fetchFileName | cd=$cd | mime=$mime | hint=$fetchNameHint")
+            // 大文件改**流式落盘**：每块 base64 立刻解码追加到临时文件，
+            // 不再把整个文件的 base64 攒在 StringBuilder 里、最后一次性解码。
+            // 旧写法对 10MB+ 的 TXT 会把内存峰值推到几十 MB（base64 串 + 解码后的整块字节数组），
+            // 手机上直接失败——这正是「大 txt 下载失败」的原因。
+            fetchTemp?.delete()
+            fetchTemp = try {
+                DownloadHelper.createBrowserTempFile(this@MainActivity)
+            } catch (e: Exception) { null }
+            fetchSize = 0L
+            DebugLog.log(
+                "FETCH",
+                "浏览器通道命名: $fetchFileName | cd=$cd | mime=$mime | hint=$fetchNameHint | 流式落盘"
+            )
         }
 
         /**
-         * 附件真实文件名上报（注入脚本从帖子 DOM 的 `<span class="attachname">` 读出）。
+         * 附件真实文件名上报（注入脚本从帖子 DOM 的 `<p class="attnm">` / `.attachname` 读出）。
          * 点下载时 contentDisposition 为 null、URL 只是脚本页，原生侧只能靠这里拿到帖子里的文件名。
          */
         @JavascriptInterface
@@ -1722,25 +1757,38 @@ class MainActivity : AppCompatActivity() {
 
         @JavascriptInterface
         fun fetchChunk(part: String?) {
-            if (part != null) fetchB64.append(part)
+            if (part.isNullOrEmpty()) return
+            val file = fetchTemp ?: return
+            try {
+                fetchSize = DownloadHelper.appendBase64Chunk(file, part, fetchSize)
+            } catch (e: Exception) {
+                DebugLog.log("FETCH", "分块写入失败: ${e.message}")
+                fetchTemp?.delete()
+                fetchTemp = null
+            }
         }
 
         @JavascriptInterface
         fun fetchEnd() {
-            val data = try {
-                android.util.Base64.decode(fetchB64.toString(), android.util.Base64.DEFAULT)
-            } catch (e: Exception) { null }
-            fetchB64.setLength(0)
-            runOnUiThread {
-                if (data == null) {
-                    DebugLog.log("FETCH", "base64 解码失败")
-                    Toast.makeText(this@MainActivity, "下载失败：数据解码错误", Toast.LENGTH_LONG).show()
-                    return@runOnUiThread
+            val temp = fetchTemp
+            fetchTemp = null
+            val size = fetchSize
+            fetchSize = 0L
+            if (temp == null || !temp.isFile || temp.length() <= 0L) {
+                temp?.delete()
+                runOnUiThread {
+                    DebugLog.log("FETCH", "没有收到数据")
+                    Toast.makeText(this@MainActivity, "下载失败：未收到文件数据", Toast.LENGTH_LONG).show()
                 }
+                return
+            }
+            runOnUiThread {
                 try {
-                    val savedName = DownloadHelper.save(this@MainActivity, data, fetchFileName, !fetchNameHint.isNullOrBlank())
+                    val savedName = DownloadHelper.saveFromFile(
+                        this@MainActivity, temp, fetchFileName, !fetchNameHint.isNullOrBlank()
+                    )
                     fetchFileName = savedName
-                    DebugLog.log("FETCH", "保存成功: $savedName (${data.size}B)")
+                    DebugLog.log("FETCH", "保存成功: $savedName (${temp.length()}B)")
                     Toast.makeText(
                         this@MainActivity,
                         "下载完成：$savedName\n保存于 Download/${Prefs.getDownloadDir(this@MainActivity)}",
@@ -1749,6 +1797,8 @@ class MainActivity : AppCompatActivity() {
                 } catch (e: Exception) {
                     DebugLog.log("FETCH", "保存失败: ${e.message}")
                     Toast.makeText(this@MainActivity, "保存失败：${e.message}", Toast.LENGTH_LONG).show()
+                } finally {
+                    temp.delete()
                 }
             }
         }
@@ -1788,7 +1838,9 @@ class MainActivity : AppCompatActivity() {
     /** 浏览器通道本次下载的「帖子内文件名」（null = 没有名字，按普通流程处理） */
     private var fetchNameHint: String? = null
     private var fetchFileName: String = ""
-    private val fetchB64 = StringBuilder()
+    /** 浏览器通道的临时文件：每块 base64 立刻解码追加到这里，fetchEnd 后落盘并删除 */
+    private var fetchTemp: java.io.File? = null
+    private var fetchSize: Long = 0L
 
     /**
      * 浏览器通道下载：原生请求被返回网页拦截时，改用页面内 fetch 获取文件，
@@ -1854,11 +1906,30 @@ class MainActivity : AppCompatActivity() {
         throw new Error((title||'服务器返回网页')+'：未找到下一层下载地址');
       }
       var cd=r.headers.get('content-disposition')||'';
-      var buf=await r.arrayBuffer(), b=new Uint8Array(buf), bin='';
-      for(var k=0;k<b.length;k+=32768){ bin+=String.fromCharCode.apply(null,b.subarray(k,k+32768)); }
-      var b64=btoa(bin), P=524288;
+      // base64 单块大小：512KB。整块进 JS 桥的开销可控，也不会把 WebView 内存顶爆。
+      var P=524288;
+      // 单块 Uint8Array -> base64。分 32768 步拼二进制串，避开 String.fromCharCode 的参数上限。
+      function sendChunk(u8){
+        if(!u8 || !u8.length) return;
+        var bin='';
+        for(var k=0;k<u8.length;k+=32768){ bin+=String.fromCharCode.apply(null,u8.subarray(k,k+32768)); }
+        var enc=btoa(bin);
+        for(var j=0;j<enc.length;j+=P) window.DiscuzApp.fetchChunk(enc.substr(j,P));
+      }
       window.DiscuzApp.fetchBegin(cd,ct);
-      for(var j=0;j<b64.length;j+=P) window.DiscuzApp.fetchChunk(b64.substr(j,P));
+      // **流式**读取：fetch 的响应体边下边发，不把整个文件读进内存。
+      // 旧写法 `await r.arrayBuffer()` 会同时持有 ArrayBuffer + 二进制串 + base64 串，
+      // 10MB 的 TXT 峰值几十 MB，手机上内存吃紧直接失败（大文件下载失败的真凶）。
+      if(r.body && r.body.getReader){
+        var reader=r.body.getReader();
+        for(;;){
+          var res=await reader.read();
+          if(res.done) break;
+          sendChunk(res.value);
+        }
+      }else{
+        sendChunk(new Uint8Array(await r.arrayBuffer()));
+      }
       window.DiscuzApp.fetchEnd();
     }
     await get('$safe',0);
