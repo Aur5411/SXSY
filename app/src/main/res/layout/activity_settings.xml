@@ -137,13 +137,14 @@
                     <com.google.android.material.textfield.TextInputEditText
                         android:id="@+id/etCustomJs"
                         android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
+                        android:layout_height="180dp"
                         android:background="#FFFFFF"
                         android:fontFamily="monospace"
-                        android:gravity="top"
+                        android:gravity="top|start"
                         android:hint="在此粘贴 JavaScript 脚本，网页加载后自动执行"
-                        android:minLines="6"
                         android:padding="12dp"
+                        android:scrollbars="vertical"
+                        android:scrollHorizontally="false"
                         android:textColor="#1E293B"
                         android:textSize="14sp" />
                 </com.google.android.material.textfield.TextInputLayout>
