@@ -1045,6 +1045,13 @@ class MainActivity : AppCompatActivity() {
      * 上报键用附件 id：尚香是纯数字 `aid=631539`，搜书吧是 base64，两种都支持（见 [auditIdOf]）。
      */
     private fun injectAttachNameJs() {
+        // 命名脚本正文（设置页可编辑，默认来自 assets/name_rules.js）。
+        // 转义后嵌进注入脚本里，用 new Function('v', src) 逐个附件执行。
+        val userSrc = (Prefs.getNameScript(this).ifBlank { Prefs.defaultNameScript(this) })
+            .replace("\\", "\\\\")
+            .replace("'", "\\'")
+            .replace("\r", "")
+            .replace("\n", "\\n")
         val js = """
 (function(){
   if(window.__dzAttNameInit) return; window.__dzAttNameInit=1;
@@ -1123,9 +1130,73 @@ class MainActivity : AppCompatActivity() {
     }catch(e){ return ''; }
   }
 
+  // ---------- 命名脚本所需的变量与工具（与 Kotlin 侧保持等价） ----------
+
+  // 站点标记清理：域名一律去掉、**长的先删**、@ 当分隔符、只清空括号
+  // （等价于 DownloadHelper.stripSiteWatermark，改动时两处要同步）
+  var MARKS=['www.soushu2025.com','soushu2025.com','www.sxsy.org','sxsy.org','www.sxsy45.com','sxsy45.com'];
+  function escRe(s){ return s.replace(/\./g,'\\.'); }
+  function blank(){ return ' '; }
+  function stripMarks(s){
+    var low=String(s).toLowerCase(), hit=false;
+    for(var i=0;i<MARKS.length;i++){ if(low.indexOf(MARKS[i])>=0){ hit=true; break; } }
+    if(!hit) return s;
+    var x=String(s);
+    for(var j=0;j<MARKS.length;j++){
+      x=x.replace(new RegExp(escRe(MARKS[j]),'gi'), blank);
+    }
+    var prev='';
+    while(prev!==x){ prev=x; x=x.replace(/[\[\]【】（）()]\s*[\[\]【】（）()]/g,''); }
+    x=x.replace(/@/g,' ');
+    x=x.replace(/[\s:：_\-—·、,，]{2,}/g,' ');
+    x=x.replace(/([:：\/])\s+/g, blank);
+    x=x.replace(/\/{3,}/g,'//');
+    x=x.replace(/\s+/g,' ');
+    x=x.replace(/\s+(\.[A-Za-z0-9]{1,8})$/, blank);
+    return x.replace(/^[\s\-_.,，:：@]+/,'').replace(/[\s\-_.,，:：@]+$/,'').trim() || 'download';
+  }
+
+  // 从帖子标题提取 书名 / 章节（等价于 DownloadHelper.bookTitleOf）
+  function extractTitle(title){
+    var t=norm(title), out={book:'',chapter:''};
+    var i=t.indexOf('《');
+    if(i<0) return out;
+    var j=t.indexOf('》', i+1);
+    if(!(j>i+1)) return out;
+    var book=t.substring(i+1,j).trim();
+    if(!book) return out;
+    out.book=book;
+    var m=/[0-9０-９]{1,4}\s*[-–—－]\s*[0-9０-９]{1,4}/.exec(t.substring(j+1));
+    if(m){
+      var r='';
+      for(var k=0;k<m[0].length;k++){
+        var ch=m[0].charAt(k), cc=ch.charCodeAt(0);
+        if(cc>=0xFF10&&cc<=0xFF19) r+=String.fromCharCode(48+(cc-0xFF10));
+        else if(ch==='–'||ch==='—'||ch==='－') r+='-';
+        else if(/\s/.test(ch)) {}
+        else r+=ch;
+      }
+      out.chapter=r;
+    }
+    return out;
+  }
+
+  // 跑设置页里的命名脚本：new Function('v', src)，脚本里用 return 返回文件名
+  function runNaming(v){
+    try{
+      var f=new Function('v', '__USER_SRC__');
+      var r=f(v);
+      return (typeof r==='string') ? r.trim() : '';
+    }catch(e){ return ''; }
+  }
+
   function scan(){
     try{
       if(!window.DiscuzApp || !window.DiscuzApp.attachName) return;
+      var subj=document.getElementById('thread_subject');
+      var h1=document.querySelector('h1.ts');
+      var pageTitle=norm(subj?subj.textContent:(h1?h1.textContent:''));
+      var tinfo=extractTitle(pageTitle);
       var links=document.querySelectorAll(
         'a[href*="mod=attachment"],a[href*="attachment.php"],a[href*="action=attachpay"]');
       for(var i=0;i<links.length;i++){
@@ -1133,9 +1204,20 @@ class MainActivity : AppCompatActivity() {
         if(!isFileLink(href)) continue;
         var id=auditOf(href);
         if(!id || reported[id]) continue;
-        var nm=nameOf(a);
+        var raw=nameOf(a);
+        if(!raw) continue;
+        reported[id]=1;
+        var v={
+          attach: stripMarks(raw),
+          attachRaw: raw,
+          title: pageTitle,
+          book: tinfo.book,
+          chapter: tinfo.chapter
+        };
+        var nm=runNaming(v);
+        // 脚本没给出名字（返回空或抛错）→ 回退到默认规则
+        if(!nm) nm = v.attach || (v.book ? v.book + (v.chapter ? '（'+v.chapter+'）' : '') : '');
         if(!nm) continue;
-        reported[id]=nm;
         try{ window.DiscuzApp.attachName(id, nm); }catch(e){}
       }
     }catch(e){}
@@ -1162,8 +1244,9 @@ class MainActivity : AppCompatActivity() {
   else window.addEventListener('load', start);
 })();
 """.trimIndent()
+            .replace("__USER_SRC__", userSrc)
         webView.evaluateJavascript(js, null)
-        DebugLog.log("ATT", "已注入附件文件名上报脚本")
+        DebugLog.log("ATT", "已注入附件文件名上报脚本（命名脚本 ${userSrc.length} 字符）")
     }
 
     /**

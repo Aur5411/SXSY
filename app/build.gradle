@@ -18,8 +18,8 @@ android {
         applicationId "com.sxsy45.app"
         minSdk 21
         targetSdk 34
-        versionCode 38
-        versionName "1.7.9"
+        versionCode 39
+        versionName "1.8.0"
     }
 
     signingConfigs {
