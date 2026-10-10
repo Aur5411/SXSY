@@ -63,7 +63,6 @@ import java.io.ByteArrayInputStream
  *
  * 页面注入脚本（onPageFinished，文档完整解析后）：
  *  - injectAdBlock()      弹窗广告屏蔽（popadv 插件 + Discuz fwin_ 广告浮层兜底）
- *  - injectFirstPostImages() 1 楼楼主发布的图片可直接查看（被站点降级成链接的图片附件还原成内联图）
  *  - injectAttachNameJs() 读取帖子内附件真实文件名并上报，用于下载时保留原名
  *  - injectForumCleanup() 摘掉外链推广分区 + 残留广告节点（规则见 AdBlocker.kt）
  *  - injectAutoSign()     每日签到自动完成
@@ -316,7 +315,6 @@ class MainActivity : AppCompatActivity() {
                 redirectLoopRetried = false
                 if (DebugLog.isEnabled()) injectClickLogger()
                 injectAdBlock()
-                injectFirstPostImages()
                 injectAttachNameJs()
                 injectForumCleanup()
                 injectAutoSign()
@@ -744,27 +742,7 @@ class MainActivity : AppCompatActivity() {
 
   // 1) CSS 强制隐藏 popadv 弹窗 + 遮罩（!important 压过 JS 的 inline style）
   var css='#popadv_popmenu,#popadv_popmask,[id^="popadv_"]{display:none!important;visibility:hidden!important;opacity:0!important;pointer-events:none!important;}';
-  // 1b) 帖子正文图片：默认隐藏去噪（小说正文以文字为主，图片多为封面/预览/签名图），
-  //     但【1 楼楼主】发布的图片要保留可见。
-  //     实现方式：**只控制可见性，不写任何覆盖式布局声明** —— 用 :not(.sxsy-opimg) 把楼主楼层的图
-  //     从隐藏规则里「排除」，而不是再补一条 !important 去压 display/width/height。
-  //     原因：站点正文图没有自己的 max-width 规则（实测 style_1_common.css 里没有 `.t_f img`），
-  //     图片尺寸全靠 <img> 属性 + Discuz 懒加载（static/js/forum_viewthread.js 会给每张图
-  //     插入一个 width×height 的占位 div，并把 img.style.width/height 先设成 1px、加载完再清掉）。
-  //     一旦我们写 `display:inline-block!important` / `height:auto!important`，就会压掉这套机制，
-  //     多张图时占位块与真图叠着出现 —— 这正是「多图片错位」的成因。
-  //     排除法不改站点任何布局属性，图片完全按站点原生方式排版。
-  //     楼层结构：Discuz 官方模板 forum/viewthread.php:327，楼主 = #postlist 里第一个楼层 div。
-  css+='.t_f img:not(.sxsy-opimg),.t_f a[href*="mod=attachment"] img:not(.sxsy-opimg),'
-      +'td.t_f img:not(.sxsy-opimg),img[id^="aimg_"]:not(.sxsy-opimg),img.zoom:not(.sxsy-opimg)'
-      +'{display:none!important;}';
-  try{
-    var s=document.createElement('style');
-    s.type='text/css';
-    s.appendChild(document.createTextNode(css));
-    (document.head||document.documentElement).appendChild(s);
-  }catch(e){}
-
+  // 1b) 帖子正文图片：**不再隐藏**，按站点原生方式显示。
   // 2) 包装 popadv 显示函数为空，从源头阻止弹出与遮罩创建
   try{
     window.popadv_showadv=function(){ return false; };
@@ -838,117 +816,6 @@ class MainActivity : AppCompatActivity() {
         webView.evaluateJavascript(js, null)
     }
 
-    /**
-     * 「1 楼楼主发布的图片」可直看（只作用于帖子里的图片，不改动其它元素）。
-     *
-     * 现象：楼主在 1 楼发的图看不到，那个位置只剩一条附件链接。
-     *
-     * 成因（两处，任一成立都会只剩链接）：
-     *  1) 站点把图片附件降级成文件链接 —— Discuz `source/function/function_attachment.php:91`
-     *     `if($attach['isimage'] && !$setting['attachimgpost'] || $attach['isimage'] == 2) $attach['isimage'] = 0;`
-     *     之后 `attachimg=0`，正文走 `discuzcode.php` 的「文件名链接」分支，页面里根本没有 `<img>`；
-     *  2) 即使渲染出了 `<img>`，本应用旧规则把帖子正文图片一律 `display:none` 隐藏了。
-     *
-     * 处理（只在楼主楼层内，即 `#postlist` 的第一个楼层 div，并打上 `.sxsy-opfloor` 标记）：
-     *
-     *  a) 给楼主楼层的图加 `.sxsy-opimg` 标记，把它从隐藏规则里**排除**（见 [injectAdBlock] 的 CSS）。
-     *     **只加 class、不写任何样式**：站点正文图没有自己的 max-width 规则，尺寸全靠 `<img>` 属性
-     *     + Discuz 懒加载（`forum_viewthread.js` 会给每张图插入 width×height 占位 div，
-     *     并把 `img.style.width/height` 先置 1px、加载完再清掉）。任何 `display/width/height`
-     *     的 `!important` 覆盖都会破坏这套机制，多张图时表现为错位。
-     *
-     *  b) 把「看起来是图片」的附件链接补一张可直看的图：
-     *     `<a href="…mod=attachment&aid=…">封面.jpg</a>`
-     *     → 在该附件条目**之前**插入 `<div class="sxsy-opimgbox"><img src="同一地址&noupdate=yes"></div>`。
-     *     - 插到条目外面（不进 `dl.tattl` / `span#attach_x`），避免被附件条目的固定尺寸 +
-     *       `overflow:hidden` 裁切（`template/default/common/module.css:1331`）；
-     *     - 不改原链接的 `display`/对齐，附件列表保持站点原样；
-     *     - `&noupdate=yes` 是 Discuz 缩略图/大图自己的写法，且服务端
-     *       `source/app/forum/child/attachment/output.php:51` 只在带 `noupdate` 时才发
-     *       `Content-Disposition: inline`；
-     *     - 只认文件名后缀是图片的附件；`attachpay`（付费未购）保持原链接；
-     *     - 已经渲染出 `<img>` 的位置不重复插入。
-     *
-     * 注意：这些 `<img>` 请求是同源 `mod=attachment` 子资源，必须让
-     * [shouldInterceptRequest] 放行（否则会被下载拦截网当文件吞掉，图片加载不出来）。
-     */
-    private fun injectFirstPostImages() {
-        val js = """
-(function(){
-  if(window.__dzOpImages) return; window.__dzOpImages=1;
-  var IMG=/\.(jpe?g|png|gif|webp|bmp|jfif|avif|heic)${'$'}/i;
-
-  // 楼主楼层 = #postlist 里的第一个楼层 div（#postlist 首个子元素是表头 table，故按 div 顺序取）
-  function firstPost(){
-    var pl=document.getElementById('postlist');
-    if(pl){
-      var kids=pl.children,i;
-      for(i=0;i<kids.length;i++){
-        if(kids[i].tagName==='DIV' && /^post_\d+${'$'}/.test(kids[i].id||'')) return kids[i];
-      }
-    }
-    var all=document.querySelectorAll('div[id^="post_"]');
-    return all.length?all[0]:null;
-  }
-
-  var floor=firstPost();
-  if(!floor) return;
-  try{
-    floor.className=(floor.className?floor.className+' ':'')+'sxsy-opfloor';
-  }catch(e){}
-
-  // ---- a) 放行标记：只加 class，绝不改样式 ----
-  // 隐藏规则是 `... img:not(.sxsy-opimg){display:none!important}`，所以给楼主楼层的图打上标记
-  // 即可放行；站点自身的尺寸/对齐/懒加载规则一概不动，多张图也不会错位。
-  function mark(){
-    var imgs=floor.querySelectorAll('.t_f img,td.t_f img,img[id^="aimg_"]'),i;
-    for(i=0;i<imgs.length;i++){
-      if(!imgs[i].classList.contains('sxsy-opimg')) imgs[i].classList.add('sxsy-opimg');
-    }
-  }
-  mark();
-  // 站点可能稍后才补进图片节点，补打几次标记（只查 class，开销极小）
-  var t=[800,2500,6000],k;
-  for(k=0;k<t.length;k++){ setTimeout(mark,t[k]); }
-
-  // ---- b) 被站点降级成「文件名链接」的图片附件 → 在正文流里补一张能直看的图 ----
-  // 关键：图片插到附件条目的【外面】（.tattl / span#attach_x 之前），不再往条目里塞。
-  // Discuz 附件条目 dl.tattl 在部分主题里是 float:left + 固定 width/height + overflow:hidden 的
-  // 小格子（template/default/common/module.css:1331），往格子里塞图必被裁切、撑错版式。
-  // 原链接的 display / 对齐也不动 —— 只新增自己的块级图，附件列表保持原样。
-  var as=floor.querySelectorAll('a[href*="mod=attachment"]'), n=0, i2;
-  for(i2=0;i2<as.length;i2++){
-    var a=as[i2], href=a.getAttribute('href')||'';
-    if(a.getAttribute('data-sxsy-img')) continue;   // 已处理
-    if(a.querySelector('img')) continue;            // 本来就是图，已由标记放行
-    if(href.indexOf('attachpay')>=0) continue;      // 付费未购，保持原链接
-    var name=(a.textContent||'').trim();
-    if(!IMG.test(name)) continue;                   // 只还原图片类附件
-    var box=a.closest('dl.tattl')||a.closest('span[id^="attach_"]')||a;
-    var host=box.parentNode;
-    if(!host) continue;
-    var wrap=document.createElement('div');
-    wrap.className='sxsy-opimgbox';
-    wrap.setAttribute('style','clear:both;margin:8px 0;');
-    var img=document.createElement('img');
-    img.className='sxsy-opimg';
-    img.setAttribute('src',href+(href.indexOf('noupdate=')>=0?'':'&noupdate=yes'));
-    img.setAttribute('alt',name);
-    img.setAttribute('title',name);
-    img.setAttribute('style','display:block;max-width:100%;height:auto;');
-    wrap.appendChild(img);
-    host.insertBefore(wrap,box);
-    a.setAttribute('data-sxsy-img','1');
-    n++;
-  }
-  if(n && window.DiscuzApp && window.DiscuzApp.signNotice){
-    try{ window.DiscuzApp.signNotice('1楼楼主图片已还原：'+n+' 张'); }catch(e){}
-  }
-})();
-""".trimIndent()
-        webView.evaluateJavascript(js, null)
-        DebugLog.log("IMG", "已注入 1 楼楼主图片直看脚本")
-    }
 
     // ---------------- 附件真实文件名（下载重命名用） ----------------
 
