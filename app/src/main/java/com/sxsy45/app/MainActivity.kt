@@ -316,6 +316,7 @@ class MainActivity : AppCompatActivity() {
                 if (DebugLog.isEnabled()) injectClickLogger()
                 injectAdBlock()
                 injectAttachNameJs()
+                injectAttachmentClickHook()
                 injectForumCleanup()
                 injectAutoSign()
                 injectAttachPayHook()
@@ -475,39 +476,73 @@ class MainActivity : AppCompatActivity() {
                 }
                 val ua = cachedUserAgent
                 if (ua.isBlank()) return null
+                // 用户刚点过这个附件：让原生下载通道接管（即时「开始下载」提示 + 系统级进度），
+                // 拦截网不抢。抢了就是对十几 MB 的直链静默探测几十秒、期间毫无反馈，
+                // 用户看到的是「点了没反应、也不能下载」，第二次点击还会被去重挡掉。
+                if (clickedRecently(url)) {
+                    DebugLog.log("INTERCEPT", "用户点击的附件，放行给下载监听: $url")
+                    return null
+                }
+                // 该地址已被另一条通道（DownloadListener 原生下载 / 此前一次拦截）接管：
+                // 不再自己探一遍，直接放行给 WebView，由接管方负责落地
+                // —— 否则会对着同一个直链并发下载两份。
+                if (claimedElsewhere(url)) {
+                    DebugLog.log("INTERCEPT", "已被其它通道接管，跳过重复探测: $url")
+                    return null
+                }
                 val referer = lastContentPageUrl
-                return try {
+                // 拦截通道一旦接管，也要立刻给反馈：这里先报一次「开始下载」，
+                // 否则用户要等整份探测完成才有任何提示。
+                val previewName = try {
+                    preferredNameFor(url)?.let { DownloadHelper.resolveFileName(url, null, it) }
+                        ?: "自动识别文件名"
+                } catch (e: Exception) { "自动识别文件名" }
+                DebugLog.log("INTERCEPT", "开始下载(拦截通道): $url | 命名=$previewName")
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "开始下载：$previewName", Toast.LENGTH_SHORT).show()
+                }
+                // 登记「拦截网接管中」：主框架导航触发的 DownloadListener 见到就让路
+                interceptInFlight[url] = System.currentTimeMillis()
+                var response: WebResourceResponse? = null
+                try {
                     val p = DownloadHelper.probe(this@MainActivity, ua, url, referer)
                     if (!p.isFile) {
                         p.file.delete()
                         handledUrls.remove(url)
                         bypassProbeUrls[url] = System.currentTimeMillis()
                         DebugLog.log("INTERCEPT", "网页，放行 WebView 原生加载: $url")
-                        null
-                    } else if (!markHandled(url)) {
+                        return null
+                    }
+                    if (!markHandled(url)) {
                         p.file.delete()
                         DebugLog.log("INTERCEPT", "重复请求，跳过: $url")
-                        null
-                    } else {
-                        val hint = preferredNameFor(p.finalUrl)
-                        val name = DownloadHelper.resolveFileName(p.finalUrl, p.disposition, hint)
-                        val savedName = DownloadHelper.saveFromFile(this@MainActivity, p.file, name, !hint.isNullOrBlank())
-                        p.file.delete()
-                        DebugLog.log("INTERCEPT", "已保存: $savedName (${p.size}B)")
-                        runOnUiThread {
-                            Toast.makeText(
-                                this@MainActivity,
-                                "下载完成：$savedName\n保存于 Download/${Prefs.getDownloadDir(this@MainActivity)}",
-                                Toast.LENGTH_LONG
-                            ).show()
-                        }
-                        htmlResponse(downloadDonePage(savedName, p.size.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()))
+                        return null
                     }
+                    val hint = preferredNameFor(p.finalUrl)
+                    val name = DownloadHelper.resolveFileName(p.finalUrl, p.disposition, hint)
+                    val savedName = DownloadHelper.saveFromFile(
+                        this@MainActivity, p.file, name, DownloadHelper.isUsableNameHint(hint)
+                    )
+                    p.file.delete()
+                    DebugLog.log("INTERCEPT", "已保存: $savedName (${p.size}B)")
+                    runOnUiThread {
+                        Toast.makeText(
+                            this@MainActivity,
+                            "下载完成：$savedName\n保存于 Download/${Prefs.getDownloadDir(this@MainActivity)}",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                    response = htmlResponse(
+                        downloadDonePage(savedName, p.size.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
+                    )
                 } catch (e: Exception) {
                     DebugLog.log("INTERCEPT", "失败: ${e.message}")
                     handledUrls.remove(url)
-                    null
+                } finally {
+                    // 探测/落盘结束（无论成败）都要解除「接管中」，否则此地址不再有通道接管
+                    interceptInFlight.remove(url)
                 }
+                return response
             }
         }
 
@@ -651,19 +686,77 @@ class MainActivity : AppCompatActivity() {
         return false
     }
 
-    /** 同一地址 5 秒内只处理一次，避免拦截通道与 DownloadListener 重复下载 */
+    /**
+     * 「已交给某条下载通道」的地址 → 时间戳。同一地址在窗口期内**只允许保存一次**，
+     * 避免「拦截通道已落盘 + DownloadListener 又下一遍」造成重复下载：
+     * 实测日志里同一个 15MB TXT 被完整下载两次（`INTERCEPT 已保存` 之后 4ms
+     * 又出现 `DL 开始原生下载`），用户看到的就是「点了没直接下 / 下了两份」。
+     *
+     * 窗口取 60 秒：大文件弱网下要几十秒，5 秒太短——拦截通道还在下载途中窗口就过期，
+     * DownloadListener 又能挤进来下一遍。
+     */
     private val handledUrls = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val HANDLED_TTL_MS = 60_000L
+
     /** HTML 探测后放行一次原生导航，防止 shouldInterceptRequest 与 WebView 互相循环 */
     private val bypassProbeUrls = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /**
+     * 拦截网**正在**探测/下载中的地址：DownloadListener 见到它直接让路，由拦截通道落地。
+     * 探测结束（成功或失败）立即移除，避免该地址再也下不下来。
+     */
+    private val interceptInFlight = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /**
+     * 用户最近点击过的附件链接 → 时间戳。
+     *
+     * 点击是**明确的下载意图**，必须由原生下载通道（DownloadListener → [onDownloadStart]）接管：
+     * 它有即时的「开始下载：<文件名>」提示和系统级进度；拦截网则是先静默整份探测一遍
+     * （十几 MB 的 TXT 要几十秒，日志实测 20 秒以上没有 `判定=` 收尾），期间没有任何反馈，
+     * 用户看到的就是「点了白嫖下载没反应、也不能下载」，第二次点击还会被去重挡掉。
+     * 所以点击过的地址一律放行给下载监听，拦截网不再抢。
+     */
+    private val clickedAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val CLICK_WINDOW_MS = 10_000L
+
+    private fun clickedRecently(url: String): Boolean {
+        val now = System.currentTimeMillis()
+        clickedAt.entries.removeIf { now - it.value > CLICK_WINDOW_MS }
+        val t = clickedAt[url] ?: return false
+        return now - t < CLICK_WINDOW_MS
+    }
+
+    /**
+     * 直链文件地址：`/data/attachment/…` 且路径以常见文件后缀结尾。
+     * 这类 URL 不可能是 HTML 跳转页/登录墙，探测只会白等一次完整下载，所以点击时直接
+     * 交给下载监听；也只有这类才启用「下载监听没接管就自己发起」的兜底。
+     */
+    private fun isDirectFileUrl(url: String): Boolean {
+        val l = url.lowercase()
+        if (!l.contains("/data/attachment/")) return false
+        val path = l.substringBefore('?')
+        return path.endsWith(".txt") || path.endsWith(".zip") || path.endsWith(".rar") ||
+            path.endsWith(".7z") || path.endsWith(".pdf") || path.endsWith(".epub")
+    }
+
+    /** 该地址是否已被其它下载通道接管（已被保存，或拦截网正在下载） */
+    private fun claimedElsewhere(url: String): Boolean {
+        val now = System.currentTimeMillis()
+        handledUrls.entries.removeIf { now - it.value > HANDLED_TTL_MS }
+        interceptInFlight.entries.removeIf { now - it.value > HANDLED_TTL_MS }
+        if (interceptInFlight.containsKey(url)) return true
+        val prev = handledUrls[url] ?: return false
+        return now - prev < HANDLED_TTL_MS
+    }
 
     private fun markHandled(url: String): Boolean {
         val now = System.currentTimeMillis()
         val it = handledUrls.entries.iterator()
         while (it.hasNext()) {
-            if (now - it.next().value > 5000) it.remove()
+            if (now - it.next().value > HANDLED_TTL_MS) it.remove()
         }
         val prev = handledUrls[url]
-        if (prev != null && now - prev < 5000) return false
+        if (prev != null && now - prev < HANDLED_TTL_MS) return false
         handledUrls[url] = now
         return true
     }
@@ -724,6 +817,39 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * 附件点击登记（**始终注入**，与 DebugLog 开关无关）。
+     *
+     * 点击「白嫖下载」这类附件链接是明确的下载意图，要优先走原生下载通道
+     * （见 [DownloadBridge.noteAttachmentClick]）。这个脚本很小、只挂一个捕获期 click 监听，
+     * 命中附件链接才回调一次 JS 桥，平常零开销。
+     *
+     * 不复用 [injectClickLogger]：那个只在开启调试日志时注入，普通用户根本不会执行。
+     */
+    private fun injectAttachmentClickHook() {
+        val js = """
+(function(){
+  if(window.__dzAttClickHook) return; window.__dzAttClickHook=1;
+  document.addEventListener('click',function(e){
+    try{
+      var n=e.target, a=null, hops=0;
+      while(n&&n.nodeType===1&&hops++<6){
+        if(n.tagName==='A'){ a=n; break; }
+        n=n.parentNode;
+      }
+      if(!a||!window.DiscuzApp||!window.DiscuzApp.noteAttachmentClick) return;
+      var href=a.getAttribute('href')||'';
+      if(!/mod=attachment|attachment\.php|\/data\/attachment\//i.test(href)) return;
+      var abs=a.href||href;
+      if(!/^https?:\/\//i.test(abs)) return;
+      window.DiscuzApp.noteAttachmentClick(abs);
+    }catch(err){}
+  },true);
+})();
+""".trimIndent()
+        webView.evaluateJavascript(js, null)
+    }
+
+    /**
      * 论坛首页/帖子页「弹窗广告」自动屏蔽。
      *
      * 站点用的是 Discuz「popadv 弹出广告」插件：弹窗容器 #popadv_popmenu、遮罩 #popadv_popmask，
@@ -772,16 +898,21 @@ class MainActivity : AppCompatActivity() {
   }catch(e){}
 
   if(!window.__sxsyFwinTimer){
+    var lastSweep=0;
     window.__sxsyFwinTimer=setInterval(function(){
-      if(popadvDirty){
-        popadvDirty=false;
-        try{
-          var p=document.getElementById('popadv_popmenu');
-          if(p && p.style && p.style.display!=='none') p.style.display='none';
-          var m=document.getElementById('popadv_popmask');
-          if(m && m.style && m.style.display!=='none') m.style.display='none';
-        }catch(e){}
-      }
+      var now=Date.now();
+      // 只有 DOM 变动过、或距上次兜底扫描满 1 秒时才做全文档扫描。
+      // killFwinAll() 是 `document.querySelectorAll('[id^="fwin_"]')` 全量属性查询，
+      // 旧写法无条件每 250ms 跑一次 → 加载期 10 秒内白跑约 40 次，是「打开页面卡顿」的一部分。
+      if(!popadvDirty && now-lastSweep<1000) return;
+      popadvDirty=false;
+      lastSweep=now;
+      try{
+        var p=document.getElementById('popadv_popmenu');
+        if(p && p.style && p.style.display!=='none') p.style.display='none';
+        var m=document.getElementById('popadv_popmask');
+        if(m && m.style && m.style.display!=='none') m.style.display='none';
+      }catch(e){}
       try{ killFwinAll(); }catch(e){}
     },250);
   }
@@ -953,6 +1084,19 @@ class MainActivity : AppCompatActivity() {
     return !t || /^(下载|附件|立即下载|点击下载|点击这里下载|重新下载|免费|购买|记录|查看|下载附件|点击文件名下载附件|download|attach|attachment)$/i.test(t);
   }
 
+  // 文件名候选是否其实是 URL / 路径。
+  //
+  // 实测坑：直链下载按钮（「白嫖下载」）的 title 被上层脚本设成了**完整直链 URL**
+  // （https://host/data/attachment/forum/202610/15/220813xxxx.txt）。它**带 .txt 后缀**，
+  // 会被后面「带扩展名才算文件名」的判据放行 → 原生侧把 URL 当附件名，
+  // 保存成 `https data_attachment_forum_202610_15_220813xxxx.txt`
+  // （域名被站点标记规则剥掉、斜杠变下划线）。真正的附件名不含 `:` 与 `/`，据此一律拒收。
+  function looksUrl(t){
+    if(!t) return true;
+    return /:\/\//.test(t) || /^[a-z][a-z0-9+.\-]*:/i.test(t) ||
+           t.indexOf('/')!==-1 || t.indexOf('\\')!==-1;
+  }
+
   // 文件链接判定：
   //   mod=attachment / attachment.php        —— 带 aid 的标准/付费附件
   //   /data/attachment/...                   —— **直链附件**（本站实际大量使用，形如
@@ -1002,54 +1146,54 @@ class MainActivity : AppCompatActivity() {
         // ① 标准模板：<span class="attachname">真实文件名</span>
         var sp=box.querySelector('.attachname');
         var t=norm(sp? sp.textContent : '');
-        if(!isGeneric(t)) return t;
+        if(!isGeneric(t) && !looksUrl(t)) return t;
         // ② 尚香书苑形态：<p class="attnm"><a>真实文件名</a></p> —— 文件名就是链接文字
         var pn=box.querySelector('p.attnm a');
         if(pn){
           var t2=norm(pn.textContent);
-          if(!isGeneric(t2) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(t2)) return t2;
+          if(!isGeneric(t2) && !looksUrl(t2) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(t2)) return t2;
         }
         // 兜底：容器 dd / .mbn / .attnm 内首个「像文件名」的文本（含扩展名）
         var cands=box.querySelectorAll('dd,p,.mbn,.attnm');
         for(var i=0;i<cands.length;i++){
           var x=norm(cands[i].textContent);
-          if(!isGeneric(x) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(x)) return x;
+          if(!isGeneric(x) && !looksUrl(x) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(x)) return x;
         }
       }
       // 最后兜底：链接自身文字 / title（部分模板直接把文件名写成链接文字）
       // ⚠ 必须**带扩展名**才算文件名：本站直链附件的按钮文字是「白嫖下载」，
       //   没有扩展名，早期版本会把它当成文件名存下来。
+      // ⚠⚠ 还必须**不是 URL/路径**：直链按钮的 title 就是完整 URL，且以 .txt 结尾，
+      //   只判扩展名会把它当文件名（见 looksUrl 注释）。
       var at=norm(a.textContent);
-      if(!isGeneric(at) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(at)) return at;
+      if(!isGeneric(at) && !looksUrl(at) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(at)) return at;
       var ti=norm(a.getAttribute && a.getAttribute('title'));
-      if(!isGeneric(ti) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(ti)) return ti;
+      if(!isGeneric(ti) && !looksUrl(ti) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(ti)) return ti;
       return '';
     }catch(e){ return ''; }
   }
 
   function scan(){
+    var rows=0;
     try{
-      if(!window.DiscuzApp || !window.DiscuzApp.attachName) return;
+      if(!window.DiscuzApp || !window.DiscuzApp.attachName) return 0;
       var links=document.querySelectorAll(
         'a[href*="mod=attachment"],a[href*="attachment.php"],a[href*="action=attachpay"],a[href*="/data/attachment/"]');
-      var rows=0;
       for(var i=0;i<links.length;i++){
         var a=links[i], href=a.getAttribute('href')||'';
         if(!isFileLink(href)) continue;
+        // ★ 先去重、再取名。nameOf() 要上溯 DOM 并在容器里 querySelectorAll，
+        //   是这个循环里最贵的一步；旧顺序对**每个**链接每轮都跑一遍 nameOf，
+        //   叠上「20 秒内每 300ms 扫一次」就是长帖页面卡顿的主因之一。
+        var id=auditOf(href);
+        var key=id||(a.href||href);
+        if(reported[key]) continue;
         var nm=nameOf(a);
         if(!nm) continue;
-        var id=auditOf(href);
-        if(id){
-          if(reported[id]) continue;
-          reported[id]=1;
-          try{ window.DiscuzApp.attachName(id, nm); }catch(e){}
-        }else{
-          // 直链附件没有 aid → 用**绝对 URL** 做键上报；原生侧下载用的就是这个 URL，能直接对上
-          var key=a.href||href;
-          if(reported[key]) continue;
-          reported[key]=1;
-          try{ window.DiscuzApp.attachNameByUrl(key, nm); }catch(e){}
-        }
+        reported[key]=1;
+        if(id){ try{ window.DiscuzApp.attachName(id, nm); }catch(e){} }
+        // 直链附件没有 aid → 用**绝对 URL** 做键上报；原生侧下载用的就是这个 URL，能直接对上
+        else { try{ window.DiscuzApp.attachNameByUrl(key, nm); }catch(e){} }
         rows++;
       }
       // 通知原生「附件名已就绪」：购买成功后的自动下载要等这一刻才触发。
@@ -1057,23 +1201,42 @@ class MainActivity : AppCompatActivity() {
       // 名字表是空的 → 多附件帖全部退回帖子标题 → 存成同一个名字。
       try{ if(window.DiscuzApp && window.DiscuzApp.attachNamesReady) window.DiscuzApp.attachNamesReady(rows); }catch(e){}
     }catch(e){}
+    return rows;
   }
 
   function start(){
     scan();
-    // 附件块可能由 AJAX/异步模板插入：监听只置脏位并合并处理，并限时 20 秒拆除，
-    // 避免「回调里扫全文档且永不停止」拖慢主线程。
-    var dirty=false, mo=null;
+    // 附件块可能由 AJAX/异步模板插入。这里用**去抖**调度，而不是固定 300ms 轮询：
+    // 旧写法「MutationObserver 只置脏 + 每 300ms 无条件 scan()」在持续变动的页面上
+    // 相当于每 300ms 做一次全文档属性子串查询（20 秒 ≈ 66 次），页面上附件链接一多
+    // 就明显卡顿。现在：DOM 有变动后 500ms 才扫一次，且两次扫描之间至少间隔 600ms，
+    // 硬上限 8 秒后彻底停（弹窗/附件块都只会在加载初期出现）。
+    var mo=null, timer=null, lastScan=0, stopped=false;
+    function run(){
+      timer=null;
+      if(stopped) return;
+      if(document.hidden){ schedule(1000); return; }   // 页面在后台就别烧 CPU
+      var now=Date.now();
+      if(now-lastScan<600){ schedule(600-(now-lastScan)); return; }
+      lastScan=now;
+      scan();
+    }
+    function schedule(delay){
+      if(stopped) return;
+      if(timer) clearTimeout(timer);
+      timer=setTimeout(run, delay||500);
+    }
+    function stop(){
+      stopped=true;
+      if(timer){ clearTimeout(timer); timer=null; }
+      try{ if(mo){ mo.disconnect(); mo=null; } }catch(e){}
+      scan();
+    }
     try{
-      mo=new MutationObserver(function(){ dirty=true; });
+      mo=new MutationObserver(function(){ schedule(500); });
       mo.observe(document.documentElement||document.body,{childList:true,subtree:true});
     }catch(e){}
-    var iv=setInterval(function(){ if(dirty){ dirty=false; scan(); } },300);
-    setTimeout(function(){
-      try{ if(mo){ mo.disconnect(); mo=null; } }catch(e){}
-      try{ clearInterval(iv); }catch(e){}
-      scan();
-    },20000);
+    setTimeout(stop,8000);
   }
 
   if(document.readyState==='complete') start();
@@ -1160,38 +1323,96 @@ class MainActivity : AppCompatActivity() {
     };
   }catch(e){}
 
-  // 是否「今天已签到」：localStorage 记录，避免重复点
+  // 是否「今天已签到」：优先看 DOM（最可信），localStorage 只作辅助。
+  //
+  // ⚠ localStorage 的 key 从 sign_ 换成 sign2_：旧版本点完入口就**乐观写入** sign_，
+  //   根本不管服务器是否真签上。结果一旦那次点击没成功（比如首页入口压根没找到、
+  //   或者弹层还需要二次确认），当天就再也不会重试，表现就是「签不了」。
+  //   换 key 让历史脏标记立即失效。
   function todayKey(){
     var d=new Date();
-    return 'sign_' + d.getFullYear() + '-' + (d.getMonth()+1) + '-' + d.getDate();
+    return 'sign2_' + d.getFullYear() + '-' + (d.getMonth()+1) + '-' + d.getDate();
   }
   function markSigned(){ try{ localStorage.setItem(todayKey(), '1'); }catch(e){} }
   function isSignedToday(){ try{ return localStorage.getItem(todayKey())==='1'; }catch(e){ return false; } }
 
-  // 找签到入口：完整签到页按钮优先，其次首页顶部图标
+  // DOM 上的「已签到」判据：头像图标 alt 会被 k_misign 写成「今日已签」；
+  // 兜底再看顶部入口的可见文字。
+  function isSignedInDom(){
+    try{
+      var img=document.getElementById('fx_checkin_b');
+      if(img){
+        var alt=img.getAttribute('alt')||'';
+        if(/已签/.test(alt)) return true;
+      }
+      var top=document.getElementById('k_misign_topb');
+      if(top && /已签/.test(top.textContent||'')) return true;
+      if(document.querySelector('.k_misign_signed,.k_signed')) return true;
+    }catch(e){}
+    return false;
+  }
+
+  // 找签到入口。
+  //
+  // 实测首页真实结构（k_misign 插件）：
+  //   <a href="https://host/plugin.php?id=k_misign:sign" id="k_misign_topb" onmouseover="showMenu(…)">
+  //     <img id="fx_checkin_b" src="…/mini2.gif" alt="今日已签">
+  //   </a>
+  // ——`#k_misign_topb` **自己就是那个 <a>**，里面只有一个 <img>。
+  // 旧实现是在它**内部**找 `a[href*="operation=qiandao"]`，另一条兜底又要求 href 含
+  // `qiandao`，而真实 href 是 `plugin.php?id=k_misign:sign`，两条都不匹配
+  // → 首页入口永远找不到 → 重试 30 次后放弃，这就是「主页不能正常签到」。
   function findEntry(){
+    // ① 完整签到页的按钮
     var a = document.querySelector('a.J_chkitot') || document.querySelector('.J_chkitot');
     if(a) return a;
+    // ② 首页顶部图标：元素自身就是 <a> 时直接用它
     var top = document.getElementById('k_misign_topb');
-    if(top){ var link = top.querySelector('a[href*="operation=qiandao"]'); if(link) return link; }
+    if(top){
+      if(String(top.tagName).toUpperCase()==='A') return top;
+      var inner = top.querySelector('a');
+      if(inner) return inner;
+    }
+    // ③ 图标本身 → 最近的 <a>（不再要求 href 含 qiandao）
     var img = document.getElementById('fx_checkin_b');
-    if(img){ var p = img.closest('a'); if(p && /qiandao/.test(p.getAttribute('href')||'')) return p; }
-    return null;
+    if(img){ var p = img.closest('a'); if(p) return p; }
+    // ④ 兜底：任何指向 k_misign / qiandao 的链接
+    return document.querySelector(
+      'a[href*="id=k_misign"],a[href*="qiandao"],a[onclick*="misign"],a[onclick*="qiandao"]');
+  }
+
+  // 入口可能点开的是 fwin 弹层：层里的「签到」按钮要再点一次
+  function confirmLayer(){
+    try{
+      var btn=document.querySelector(
+        '#fwin_misign a[href*="id=k_misign:sign"], #fwin_misign a[href*="qiandao"],' +
+        '#fwin_qiandao a[href*="qiandao"], #fwin_misign button[type="submit"],' +
+        '#fwin_qiandao button[type="submit"], #fwin_misign .k_misign_btn, #fwin_qiandao .k_misign_btn');
+      if(btn){
+        if(window.DiscuzApp) window.DiscuzApp.signNotice('自动签到：已点弹层确认');
+        try{ btn.click(); }catch(e){}
+      }
+    }catch(e){}
   }
 
   // 自动点击签到入口
-  var tries = 0;
+  var tries = 0, attempted = false;
   function clickSign(){
-    if(isSignedToday()) return;
+    if(attempted) return;
+    if(isSignedInDom()){ markSigned(); return; }   // DOM 已显示「已签」→ 只记录，不再点
+    if(isSignedToday()) return;                    // 今天确实签成功过
     var a = findEntry();
     if(a){
-      // 已签到状态下图标常会变（无 qiandao 链接），findEntry 找不到即不会误点
+      attempted = true;                            // 只在本次页面内防重复，不再「一点就锁死一天」
       if(window.DiscuzApp) window.DiscuzApp.signNotice('自动签到：已触发签到');
       try{ a.click(); }catch(e){}
-      markSigned();  // 乐观标记，避免同一页面重复触发；真正结果由服务器决定
+      // 弹层二次确认 + 结果核对：只有 DOM 真的变成「已签」才写 localStorage
+      setTimeout(confirmLayer, 700);
+      setTimeout(function(){ if(isSignedInDom()) markSigned(); }, 2600);
       return;
     }
     if(tries++ < 30){ setTimeout(clickSign, 500); }
+    else if(window.DiscuzApp) window.DiscuzApp.signNotice('自动签到：未找到签到入口（可到签到页手动签）');
   }
   setTimeout(clickSign, 1500);
 })();
@@ -1258,6 +1479,26 @@ class MainActivity : AppCompatActivity() {
   var lastAttemptTs=0;     // 上次尝试处理浮层时间
   var handledAny=0;        // 是否已处理过浮层
 
+  // 浮层是否可能刚出现。findFloat() 是 `querySelectorAll('.fwin,[id*="attachpay"],…')`
+  // 全文档子串查询，很贵：旧实现每 400ms 无条件跑一次，遇到「有付费附件但没自动购买
+  // （超价/金币不足）」的帖子页会**永不停止**地 400ms 一次全文档扫描 —— 这是页面卡顿的主因之一。
+  // 现在改为事件驱动：只有插入的节点自身 id/class 命中 fwin/attachpay 才置位，
+  // 置位后那一轮才做昂贵查询（并且只在 tryHandle 里用一次）。
+  var floatHint=false;
+  try{
+    new MutationObserver(function(recs){
+      for(var i=0;i<recs.length;i++){
+        var as=recs[i].addedNodes;
+        for(var j=0;j<as.length;j++){
+          var nd=as[j];
+          if(!nd || nd.nodeType!==1) continue;
+          var tag=(nd.id||'')+' '+(typeof nd.className==='string'?nd.className:'');
+          if(/fwin|attachpay/i.test(tag)){ floatHint=true; return; }
+        }
+      }
+    }).observe(document.documentElement||document.body,{childList:true,subtree:true});
+  }catch(_){}
+
   function visible(el){
     if(!el) return false;
     if(el.style.display==='none') return false;
@@ -1323,24 +1564,24 @@ class MainActivity : AppCompatActivity() {
     }catch(_){}
   }
 
-  // 持续轮询：购买浮层是用户点附件后由 showWindow AJAX 异步弹出，
-  // 因此需要监听一段时间。为省电省 CPU：真正 clearInterval 停止，且只在页面可见时轮询。
+  // 轮询：购买浮层是用户点附件后由 showWindow AJAX 异步弹出，所以需要观察一段时间。
+  // 省 CPU 措施：页面不可见直接跳过；只有 floatHint 置位（真有 fwin/attachpay 节点插入）
+  // 才做昂贵查询；无论有没有付费附件，最多活 45 秒就真正 clearInterval 停掉。
   var timer=setInterval(function(){
-    LIFETIME+=400;
+    LIFETIME+=700;
     try{
       // 页面不可见（切到别的界面）时跳过本轮，避免后台空转
       if(document.hidden) return;
-      var hasAttachPayLink=!!document.querySelector('a[href*="attachpay"]');
-      if(!handledAny && tryHandle()){
-        handledAny=1;
+      if(!handledAny && floatHint){
+        floatHint=false;
+        if(tryHandle()) handledAny=1;
       }
-      // 已点过购买 或 普通页面(无任何付费附件迹象)超时：真正停掉轮询
-      if(handledAny || (!hasAttachPayLink && LIFETIME>12000)){
+      if(handledAny || LIFETIME>45000){
         window.__sxsyAutopayActive=0;
         clearInterval(timer);
       }
     }catch(_){}
-  },400);
+  },700);
 
   // 初次立刻尝试一次（若浮层已由服务器端直接渲染而非 AJAX）
   try{ if(!handledAny && tryHandle()) handledAny=1; }catch(_){}
@@ -1553,6 +1794,36 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        /**
+         * 用户点击了附件/文件链接（注入的点击脚本回调）。
+         *
+         * 作用是把「用户主动点下载」这件事**优先交给原生下载通道**：
+         *  1) 拦截网不再对这个地址抢先探测（见 shouldInterceptRequest 里的 clickedRecently 判定），
+         *     于是立刻走 DownloadListener，用户马上看到「开始下载：<文件名>」并看到系统级进度；
+         *  2) 兜底自愈：系统下载监听正常在几百毫秒内接管（真实点击实测 ~600ms），
+         *     若 3 秒后仍没人接管（个别模板点击不触发 DownloadListener），这里自己发起下载，
+         *     避免「点了完全没反应」。只对**直链文件**做兜底——`mod=attachment` 可能返回
+         *     登录墙/提示页，那种必须留给页面自己渲染。
+         */
+        @JavascriptInterface
+        fun noteAttachmentClick(url: String?) {
+            if (url.isNullOrBlank() || !isTrustedJsUrl(url)) return
+            if (!isDownloadCandidate(url)) return
+            clickedAt[url] = System.currentTimeMillis()
+            DebugLog.log("CLICK", "登记附件点击（原生通道优先）: $url")
+            if (!isDirectFileUrl(url)) return
+            runOnUiThread {
+                webView.postDelayed({
+                    if (handledUrls.containsKey(url) || interceptInFlight.containsKey(url)) {
+                        DebugLog.log("CLICK", "下载监听已接管，无需兜底: $url")
+                    } else {
+                        DebugLog.log("CLICK", "下载监听未接管，兜底发起下载: $url")
+                        onDownloadStart(url, null, null)
+                    }
+                }, 3000L)
+            }
+        }
+
         /** JS 拦截到的付费附件链接：交给原生完成购买+下载 */
         @JavascriptInterface
         fun buyAttachment(url: String?) {
@@ -1622,6 +1893,13 @@ class MainActivity : AppCompatActivity() {
             if (auditId.isNullOrBlank() || name.isNullOrBlank()) return
             val clean = name.trim().replace(Regex("[\\r\\n\\t]"), " ")
             if (clean.isEmpty() || clean.length > 120) return
+            // 拒收「其实是 URL / 路径」的候选（详见 DownloadHelper.isUsableNameHint）。
+            // 上游抽取脚本会把直链下载按钮的 title（=完整直链 URL）当文件名报上来，
+            // 一旦入库，下载就存成 `https data_attachment_forum_...`。
+            if (!DownloadHelper.isUsableNameHint(clean)) {
+                DebugLog.log("ATT", "忽略疑似 URL 的附件名: $auditId -> $clean")
+                return
+            }
             attachNames[auditId.trim()] = clean
             DebugLog.log("ATT", "附件名上报: $auditId -> $clean")
         }
@@ -1635,6 +1913,11 @@ class MainActivity : AppCompatActivity() {
             if (url.isNullOrBlank() || name.isNullOrBlank()) return
             val clean = name.trim().replace(Regex("[\\r\\n\\t]"), " ")
             if (clean.isEmpty() || clean.length > 160) return
+            // 同 attachName：URL 冒充文件名一律不入库（name == url 也是这种误报的典型形态）
+            if (!DownloadHelper.isUsableNameHint(clean) || clean.equals(url.trim(), ignoreCase = true)) {
+                DebugLog.log("ATT", "忽略疑似 URL 的直链附件名: ${url.trim().takeLast(40)} -> $clean")
+                return
+            }
             attachNamesByUrl[url.trim()] = clean
             DebugLog.log("ATT", "直链附件名上报: ${url.trim().takeLast(40)} -> $clean")
         }
@@ -2036,11 +2319,27 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "请授予存储权限后重新点击下载", Toast.LENGTH_LONG).show()
             return
         }
+        // ——— 通道去重：同一地址只允许落盘一次 ———
+        // 拦截网（shouldInterceptRequest → probe）与系统下载监听（DownloadListener）都会命中
+        // 附件直链：前者在子资源/直链请求上把文件落盘并回一个结果页，后者随后又整份下一遍。
+        // 实测同一 15MB TXT 被完整下载两次。这里先让路，再由下面 markHandled 占位。
+        if (claimedElsewhere(httpUrl)) {
+            DebugLog.log("DL", "已被其它通道接管，跳过重复下载: $httpUrl")
+            Toast.makeText(this, "该文件正在下载中，请勿重复点击", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!markHandled(httpUrl)) {
+            DebugLog.log("DL", "该地址刚已保存，跳过重复下载: $httpUrl")
+            Toast.makeText(this, "该文件刚刚已下载", Toast.LENGTH_SHORT).show()
+            return
+        }
         // 命名来源优先级（**按附件身份**，绝不退化到"页面上随便一个名字"）：
         //  1) directNameHint —— tryAutoDownloadAfterBuy 的 JS 在定位到这个附件时算好的名字；
         //  2) directAid → attachNames[aid] —— 同一次调用的附件 id，名字表兜底；
         //  3) preferredNameFor(url) —— 从下载 URL 的 aid 反查名字表，再退回帖子标题规则。
-        val jsHint = directNameHint?.takeIf { it.isNotBlank() }
+        // 三者都可能拿到「其实是 URL」的脏候选（直链按钮 title 就是完整直链），
+        // 由 DownloadHelper.resolveFileName / isUsableNameHint 在入库前统一拦掉。
+        val jsHint = directNameHint?.takeIf { DownloadHelper.isUsableNameHint(it) }
         val jsAid = directAid?.takeIf { it.isNotBlank() }
         directNameHint = null
         directAid = null
@@ -2059,10 +2358,11 @@ class MainActivity : AppCompatActivity() {
         Toast.makeText(this, "开始下载：$nameDisplay", Toast.LENGTH_SHORT).show()
         DownloadHelper.start(
             this, webView.settings.userAgentString, httpUrl,
-            contentDisposition, webView.url, hint
-        ) { origUrl ->
-            runBrowserFetch(origUrl)
-        }
+            contentDisposition, webView.url, hint,
+            onHtmlFallback = { origUrl -> runBrowserFetch(origUrl) },
+            // 下载失败要释放占位，否则用户在 60 秒窗口内重试会被当成「重复下载」直接跳过
+            onResult = { ok -> if (!ok) handledUrls.remove(httpUrl) }
+        )
     }
 
     /** UA 由设置页开关决定，默认电脑版 */

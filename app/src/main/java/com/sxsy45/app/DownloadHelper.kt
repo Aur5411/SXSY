@@ -46,12 +46,16 @@ object DownloadHelper {
      *        `forum.php?mod=attachment&aid=…`（解析出来是脚本页名），只有帖子里的名字才是用户想要的。
      * @param onHtmlFallback 原生请求最终仍返回网页时回调（主线程），参数为原始下载地址；
      *        传 null 则直接抛错提示
+     * @param onResult 下载结束回调（主线程）：true = 已落盘或已成功转交浏览器通道，
+     *        false = 抛错失败。调用方（MainActivity 的通道去重）据此在失败时释放占位，
+     *        否则用户 60 秒内重试会被误判成「重复下载」而跳过。
      */
     fun start(
         ctx: Context, userAgent: String, url: String,
         contentDisposition: String?, referer: String?,
         nameHint: String? = null,
-        onHtmlFallback: ((String) -> Unit)? = null
+        onHtmlFallback: ((String) -> Unit)? = null,
+        onResult: ((Boolean) -> Unit)? = null
     ) {
         val appCtx = ctx.applicationContext
         thread {
@@ -64,15 +68,38 @@ object DownloadHelper {
                         Toast.makeText(appCtx, "下载完成：$finalName\n保存于 Download/${Prefs.getDownloadDir(appCtx)}", Toast.LENGTH_LONG).show()
                     }
                 }
+                if (onResult != null) mainHandler.post { onResult(true) }
             } catch (e: Exception) {
                 mainHandler.post {
                     Toast.makeText(appCtx, "下载失败：${e.message}", Toast.LENGTH_LONG).show()
                 }
+                if (onResult != null) mainHandler.post { onResult(false) }
             }
         }
     }
 
     // ---------------- 文件名处理 ----------------
+
+    /**
+     * 判断一个「文件名候选」是否可用作附件名。
+     *
+     * 返回 false 的两类：
+     *  1. 空白；
+     *  2. **其实是 URL / 路径**。页面上的直链下载按钮（「白嫖下载」）常把 `title` 设成
+     *     完整直链 `https://host/data/attachment/forum/202610/15/220813xxx.txt`，
+     *     抽取脚本会把它当文件名上报。它**带 `.txt` 后缀**，只判「有没有扩展名」是拦不住的：
+     *     入库后保存成 `https data_attachment_forum_202610_15_220813xxx.txt`
+     *     （站点域名被 [stripSiteWatermark] 剥掉、斜杠被替换成下划线）。
+     *     正常文件名不含 `:` 与 `/`（Android 上也不允许），据此一律拒收。
+     */
+    fun isUsableNameHint(name: String?): Boolean {
+        val t = name?.trim() ?: return false
+        if (t.isEmpty()) return false
+        if (t.contains("://")) return false
+        if (Regex("^[a-zA-Z][a-zA-Z0-9+.\\-]*:").containsMatchIn(t)) return false
+        if (t.contains('/') || t.contains('\\')) return false
+        return true
+    }
 
     /**
      * 从 Content-Disposition / URL 中解析文件名，并做乱码修复 + 去网站标记。
@@ -96,8 +123,9 @@ object DownloadHelper {
      */
     fun resolveFileName(url: String, contentDisposition: String?, nameHint: String? = null): String {
         // 0. 最高优先级：帖子标题（书名号内）或帖子内附件名
-        if (!nameHint.isNullOrBlank()) {
-            val raw = nameHint.trim()
+        val hint = nameHint?.takeIf { isUsableNameHint(it) }
+        if (hint != null) {
+            val raw = hint.trim()
             val needsRepair = raw.contains('\uFFFD') || looksMojibake(raw)
             var cleaned = (if (needsRepair) fixEncoding(raw) else raw)
                 .replace(Regex("[\\\\/:*?\"<>|\\uFFFD]"), "_")
@@ -810,9 +838,10 @@ object DownloadHelper {
             // 下载内容先限额读入临时文件，避免大 TXT 形成整文件内存副本。
             val temp = File.createTempFile("download_", ".part", ctx.cacheDir)
             // 名字来自帖子内 attachname 时原样保留（不剥站点标记、不做多编码猜测）。
-            // 只以 nameHint 是否存在为准：即使响应头把 name 换成了别的（含 (1) 后缀等），
-            // 也不能因此丢掉「原样保留」语义 —— 用户要的就是帖子里的那个文件名。
-            val keepAsIs = !nameHint.isNullOrBlank()
+            // 只以 nameHint 是否「可用」为准（URL/路径冒充的候选不算数，见 isUsableNameHint）：
+            // 即使响应头把 name 换成了别的（含 (1) 后缀等），也不能因此丢掉「原样保留」语义
+            // —— 用户要的就是帖子里的那个文件名。
+            val keepAsIs = isUsableNameHint(nameHint)
             val finalName = try {
                 conn.inputStream.use { input -> copyLimitedToFile(input, temp, MAX_DOWNLOAD_BYTES) }
                 saveFromFile(ctx, temp, name, keepAsIs)
