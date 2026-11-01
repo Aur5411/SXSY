@@ -74,7 +74,6 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val REQ_STORAGE = 100
-        private const val REQ_SETUP = 101
         /** 从「历史记录」页 / 帖子独立界面打开指定网址时，Intent 携带的 URL 键 */
         const val EXTRA_OPEN_URL = "open_url"
         /**
@@ -91,6 +90,71 @@ class MainActivity : AppCompatActivity() {
         const val EXTRA_SCREEN_DEPTH = "screen_depth"
         /** 独立界面堆叠上限（最多 3 层：版面列表 → 列表型派生页 → 帖子） */
         private const val MAX_SCREEN_DEPTH = 2
+
+        /**
+         * 「最新地址」发布页探测脚本。
+         *
+         * 只做「看」不做「跳」：返回 {landing, target}，跳转交给 Kotlin ——
+         * 必须先把目标域名登记进可信域名表，再发起导航，否则会被自己的站外拦截掐死。
+         * 取值顺序：`#enterButton` → `#domainText` 文本 → 全页链接里文案打分最高的一条。
+         */
+        private const val LANDING_PROBE_JS = """
+(function(){
+  try{
+    var eb=document.getElementById('enterButton');
+    var dt=document.getElementById('domainText');
+    var landing=!!(eb||dt);
+    if(!landing){
+      var t=(document.title||'');
+      var body=(document.body?document.body.innerText:'')||'';
+      if(/最新(访问)?地址/.test(t)||/最新(访问)?地址/.test(body.slice(0,3000))) landing=true;
+    }
+    if(!landing) return JSON.stringify({landing:false,target:'',url:location.href});
+    function ok(href){
+      if(!href) return '';
+      href=String(href).trim();
+      if(href.charAt(0)==='#') return '';
+      if(/^javascript:/i.test(href)) return '';
+      if(/^https?:\/\//i.test(href)) return href;
+      if(/^[a-z0-9-]+(\.[a-z0-9-]+)+(\/|$)/i.test(href)) return 'https://'+href;
+      return '';
+    }
+    function bad(u){
+      var host=(u.split('/')[2]||'').toLowerCase();
+      if(!host) return true;
+      if(host===location.hostname) return true;
+      var ban=['t.me','telegram.me','telegram.org','twitter.com','x.com','facebook.com','discord.gg','discord.com','wa.me','whatsapp.com','youtube.com','example.com'];
+      for(var i=0;i<ban.length;i++){ if(host===ban[i]||host.length>ban[i].length&&host.slice(-(ban[i].length+1))==='.'+ban[i]) return true; }
+      return false;
+    }
+    var target='';
+    if(eb){ var t1=ok(eb.getAttribute('href')||eb.href); if(t1&&!bad(t1)) target=t1; }
+    if(!target&&dt){
+      var dom=(dt.textContent||'').replace(/\s+/g,'').replace(/^https?:\/\//i,'').replace(/\/.*$/,'');
+      if(/^[a-z0-9-]+(\.[a-z0-9-]+)+$/i.test(dom)){
+        var t2='https://'+dom+'/';
+        if(!bad(t2)) target=t2;
+      }
+    }
+    if(!target){
+      var as=document.querySelectorAll('a[href]'),best='',bestScore=-1;
+      for(var i=0;i<as.length;i++){
+        var a=as[i],href=ok(a.getAttribute('href')||a.href);
+        if(!href||bad(href)) continue;
+        var txt=((a.textContent||'')+(a.getAttribute('title')||'')).replace(/\s+/g,'');
+        var s=-1;
+        if(txt.indexOf('进入论坛')>=0||txt.indexOf('立即进入')>=0||txt==='进入') s=5;
+        else if(txt.indexOf('最新地址')>=0||txt.indexOf('最新网址')>=0) s=4;
+        else if(txt.indexOf('进入')>=0||txt.indexOf('最新')>=0) s=3;
+        if(a.id==='enterButton') s+=6;
+        if(s>bestScore){ bestScore=s; best=href; }
+      }
+      if(bestScore>=3) target=best;
+    }
+    return JSON.stringify({landing:landing,target:target,url:location.href,title:(document.title||'').slice(0,40)});
+  }catch(e){ return JSON.stringify({landing:false,target:'',err:String(e)}); }
+})()
+"""
     }
 
     /** 适配高刷新率屏幕：在同分辨率模式中选刷新率最高的（API 23+） */
@@ -121,12 +185,29 @@ class MainActivity : AppCompatActivity() {
     private var lastDesktopMode: Boolean? = null
     // 从「历史记录」页打开链接后，本次 onResume 不得用配置的首页覆盖掉它
     private var openedFromHistory = false
-    // 首次启动：尚未配置论坛网址，正等待从设置页返回（期间 onResume 不自动加载）
-    private var awaitingSetup = false
     // 是否已弹过首页加载失败提示，避免多次打断
     private var homeErrorShown = false
     // 登录回跳死循环(ERR_TOO_MANY_REDIRECTS)的自动恢复标记：单次导航只自动恢复一次，避免自身再循环
     private var redirectLoopRetried = false
+
+    // —— 发布页 → 论坛 的自动进入链路 ——
+    // 站点 2026-10 大改版：老域名(sxsy45.com) 301 到「最新地址」导航页(sxsy.pw)，
+    // 页面上列出当前论坛域名(如 sxsy33.com)，必须点「进入」才到论坛。论坛域名会轮换，
+    // 所以不再写死论坛域名，而是「入口页 → 读最新地址 → 登记域名 → 直达论坛 → 写回设置」。
+    /** 是否正在走「进入论坛」链路（只在这条链路上做自动跳转/重试，普通浏览不打扰） */
+    private var entryMode = false
+    /** 当前页面被判定为「最新地址」发布页（此时点任何站外链接都视为进论坛，不再拦截） */
+    @Volatile private var onLandingPage = false
+    /** 自动跳转的次数与时间戳（防抖，避免同一页多次 onPageFinished 连点） */
+    private var autoJumpAttempt = 0
+    private var lastAutoJumpTs = 0L
+    private val autoJumpPoll = Runnable { probeLanding(webView.url) }
+    /** 入口页候选（第一个是固定入口，后面是它 301 指向的发布页本体；任一可用即可） */
+    private val ENTRY_URLS = listOf(Prefs.ENTRY_URL, "https://sxsy.pw")
+    /** 当前试到第几个入口页 */
+    private var entryTryIdx = 0
+    /** 论坛域名失效时是否已经回落过一次发布页（防止反复重试） */
+    private var fallbackToEntryTried = false
 
     // 版面列表「自动加载下一页」的返回还原（1.3.19 起改为结构化方案）：
     // 站点是把后续页用 JS 追加进当前 DOM，而 Android WebView 的 goBack 一定会重建文档
@@ -185,13 +266,9 @@ class MainActivity : AppCompatActivity() {
         if (!openUrl.isNullOrBlank()) {
             handleOpenUrl(openUrl)
         } else if (savedInstanceState == null) {
-            if (Prefs.getUrl(this).isBlank()) {
-                // 首次启动、尚未配置网址：先进入设置页填写，保存返回后加载
-                awaitingSetup = true
-                startActivityForResult(Intent(this, SettingsActivity::class.java), REQ_SETUP)
-            } else {
-                loadHome()
-            }
+            // 不再强制首次必须手填网址：没配置（或配置的还是发布页域名）时
+            // 直接走「发布页 → 最新地址 → 论坛」，进站后自动把论坛域名写回设置。
+            loadHome()
         }
     }
 
@@ -213,8 +290,6 @@ class MainActivity : AppCompatActivity() {
         // 必须在所有提前 return 之前调用：否则从帖子界面返回版面列表时，
         // 因 returningFromThreadScreen 提前 return，本 WebView 会一直停留在暂停态而卡死。
         try { webView.onResume() } catch (_: Exception) {}
-        // 等待首次设置期间：不自动加载，等 onActivityResult 清除标记后由本方法加载
-        if (awaitingSetup) return
         // 从设置页返回后：网址 / 电脑版开关可能已改变，按需重新加载
         val url = Prefs.getUrl(this)
         val desktop = Prefs.isDesktopMode(this)
@@ -229,22 +304,10 @@ class MainActivity : AppCompatActivity() {
             returningFromThreadScreen = false
             return
         }
-        val target = url.ifBlank { Prefs.DEFAULT_FORUM_URL }
+        // 配置为空、或配置的仍是发布页域名（老用户沿用的 sxsy45.com 等）：走入口页自动进论坛
+        val target = if (url.isBlank() || isEntryHostUrl(url)) Prefs.ENTRY_URL else url
         if (uaChanged || target != lastLoadedUrl) {
             loadUrl(target)
-        }
-    }
-
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == REQ_SETUP) {
-            if (Prefs.getUrl(this).isBlank()) {
-                // 首次启动且用户未保存网址：强制再次进入设置页，直到填写/确认网址为止
-                awaitingSetup = true
-                startActivityForResult(Intent(this, SettingsActivity::class.java), REQ_SETUP)
-            } else {
-                awaitingSetup = false
-            }
         }
     }
 
@@ -306,6 +369,9 @@ class MainActivity : AppCompatActivity() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 progressBar.visibility = View.VISIBLE
                 if (url != null && !isDownloadCandidate(url)) lastContentPageUrl = url
+                // 已离开发布页进到论坛：清掉「发布页」标记，别让后续站外链接被误放行
+                val startedHost = hostOf(url)
+                if (startedHost != null && isForumHost(startedHost)) onLandingPage = false
                 DebugLog.log("PAGE", "加载开始: $url")
             }
 
@@ -324,6 +390,8 @@ class MainActivity : AppCompatActivity() {
                 injectCustomJs()   // 用户自定义脚本最后注入（在内置脚本之后）
                 updateTitle()
                 recordHistory(view, url)
+                // 发布页 → 论坛 的自动进入（入口链路 / 未知域名时才探，普通浏览不加开销）
+                handlePageLoaded(url)
                 // 购买成功后刷新了帖子页：自动找该 aid 已生效的下载链接并下载。
                 // 排在附件名上报之后（injectAttachNameJs 会回调 attachNamesReady 提前触发）；
                 // 这里只是兜底排一次，避免 JS 桥没回调时卡住不下载。
@@ -408,6 +476,28 @@ class MainActivity : AppCompatActivity() {
                 if (req != null && req.isForMainFrame && !homeErrorShown &&
                     (isEntryNetworkError(code) || code == android.webkit.WebViewClient.ERROR_REDIRECT_LOOP)
                 ) {
+                    // 论坛域名又轮换了（DNS 解析不到 / 连不上）：先自动回落到发布页重新取最新地址，
+                    // 这条兜底让「站点换域名」不再需要等 App 更新。回落只做一次，避免死循环。
+                    val failedUrl = errUrl ?: ""
+                    if (!threadMode) {
+                        if (entryMode || isEntryHostUrl(failedUrl)) {
+                            // 入口页本身打不开：换下一个候选入口（固定入口 ↔ 发布页）
+                            if (entryTryIdx < ENTRY_URLS.size - 1) {
+                                entryTryIdx++
+                                DebugLog.log("ENTRY", "入口页失败，换候选: ${ENTRY_URLS[entryTryIdx]}")
+                                runOnUiThread { webView.loadUrl(ENTRY_URLS[entryTryIdx]) }
+                                return
+                            }
+                        } else if (!fallbackToEntryTried) {
+                            fallbackToEntryTried = true
+                            DebugLog.log("ENTRY", "论坛域名不可用，回落发布页: $failedUrl")
+                            runOnUiThread {
+                                Toast.makeText(this@MainActivity, "当前域名不可用，正在获取最新地址…", Toast.LENGTH_SHORT).show()
+                                beginForumEntry()
+                            }
+                            return
+                        }
+                    }
                     homeErrorShown = true
                     runOnUiThread {
                         AlertDialog.Builder(this@MainActivity)
@@ -428,7 +518,7 @@ class MainActivity : AppCompatActivity() {
                 // 非主站域名（中转/资源等）证书过期则放行，保持正常功能
                 val errUrl = error?.url ?: ""
                 val host = try { Uri.parse(errUrl).host?.lowercase() } catch (e: Exception) { null }
-                val isMainHost = host != null && trustedHosts().any { h ->
+                val isMainHost = host != null && forumHosts().any { h ->
                     host == h || host.endsWith(".$h")
                 }
                 if (isMainHost) {
@@ -1722,12 +1812,182 @@ class MainActivity : AppCompatActivity() {
         }, 300L)
     }
 
-    /** 打开论坛首页（设置里配置的网址，为空用默认首页） */
+    /**
+     * 打开首页。
+     *
+     * 站点改版后，配置的网址可能还是老域名（会 301 到发布页）甚至为空 ——
+     * 这两种情况都走「发布页 → 最新地址 → 论坛」的自动进入链路，打开软件就直接进论坛，
+     * 不再停在发布页让用户自己点「进入」。
+     */
     private fun loadHome() {
         homeErrorShown = false
-        loadUrl(Prefs.getHomeUrl(this))
+        val configured = Prefs.getUrl(this)
+        if (configured.isBlank() || isEntryHostUrl(configured)) {
+            beginForumEntry()
+        } else {
+            entryMode = false
+            loadUrl(configured)
+        }
     }
 
+    // ============ 发布页 → 论坛 自动进入 ============
+
+    /**
+     * 开始走入口链路：先打开固定的发布页入口，再由 [probeLanding] 读出「最新地址」直达论坛。
+     * 入口页本身是固定的（sxsy45.com 会 301 到当前发布页），所以论坛域名怎么轮换都不必改代码。
+     */
+    private fun beginForumEntry() {
+        entryMode = true
+        autoJumpAttempt = 0
+        onLandingPage = false
+        entryTryIdx = 0
+        DebugLog.log("ENTRY", "开始进入论坛：${ENTRY_URLS[0]}")
+        loadUrl(ENTRY_URLS[0])
+    }
+
+    /** 已进入真正的论坛页：退出入口链路，并把论坛根地址写回设置 */
+    private fun endForumEntry(success: Boolean) {
+        if (!entryMode && success) return
+        entryMode = false
+        DebugLog.log("ENTRY", if (success) "已进入论坛" else "放弃入口链路")
+    }
+
+    /**
+     * 把成功进入的论坛地址写回设置（协议 + 主机 + 端口，去掉 path/query），
+     * 同时登记为可信域名，下次启动就能直接进，不必再穿一次发布页。
+     */
+    private fun rememberForumUrl(url: String?) {
+        val h = hostOf(url) ?: return
+        if (Prefs.getEntryHosts(this).any { matchesHost(h, it) }) return   // 发布页本身不记
+        registerTrustedHost(h)
+        val root = try {
+            val u = java.net.URL(url)
+            val port = if (u.port > 0 && u.port != 80 && u.port != 443) ":${u.port}" else ""
+            "${u.protocol}://${u.host}$port/"
+        } catch (e: Exception) { return }
+        if (Prefs.getUrl(this) != root) {
+            Prefs.setUrl(this, root)
+            DebugLog.log("ENTRY", "已自动记录论坛网址: $root")
+        }
+        // 同步 lastLoadedUrl：否则下一次 onResume 会认为「配置的首页」和「当前页」不一致，
+        // 把用户正在看的页面（比如登录页）重载回首页
+        lastLoadedUrl = root
+    }
+
+    /**
+     * 页面加载完成后的入口判定：
+     *  - 在发布页域名上 / 处于入口链路 / 停在未知域名 → 探测一下页面结构；
+     *  - 普通浏览（已知论坛域名）直接跳过，不增加任何开销。
+     */
+    private fun handlePageLoaded(url: String?) {
+        if (!isRealHttpPage(url) || threadMode) return
+        val h = hostOf(url) ?: return
+        if (entryMode || isEntryHostUrl(url) || !isForumHost(h)) {
+            probeLanding(url)
+        } else {
+            onLandingPage = false
+        }
+    }
+
+    /**
+     * 探测当前页是不是「最新地址」发布页，并找出该点的「进入」链接。
+     *
+     * 发布页结构（2026-10 改版后，见站点快照）：
+     *   <span id="domainText">sxsy33.com</span>
+     *   <a id="enterButton" class="btn primary" href="https://sxsy33.com/">进入</a>
+     * 兼容两种取值方式：href 是真实地址（当前形态）；href 为 `#` 时用 #domainText 的文本拼。
+     * 找不到链接则短暂轮询几次（页面可能先经空白页/延迟注入）。
+     */
+    private fun probeLanding(pageUrl: String?) {
+        val now = System.currentTimeMillis()
+        if (autoJumpAttempt == 0) lastAutoJumpTs = now
+        if (now - lastAutoJumpTs > 12000) { autoJumpAttempt = 0; lastAutoJumpTs = now }
+        autoJumpAttempt++
+        webView.evaluateJavascript(LANDING_PROBE_JS,
+            android.webkit.ValueCallback<String> { res -> onLandingProbed(pageUrl, res) })
+    }
+
+    private fun onLandingProbed(pageUrl: String?, res: String?) {
+        val clean = decodeJsResult(res)
+        val info = try {
+            if (clean.isBlank() || clean == "null") null else org.json.JSONObject(clean)
+        } catch (_: Exception) { null }
+        if (info == null) { scheduleNextProbe(pageUrl); return }
+
+        val landing = info.optBoolean("landing", false)
+        val target = info.optString("target", "").trim()
+            .ifBlank { extractEscapedField(res, "target") ?: "" }
+        val pageHost = hostOf(pageUrl)
+
+        if (!landing) {
+            // 不是发布页 → 已经进了论坛（或论坛直接换了域名）
+            onLandingPage = false
+            if (pageHost != null && !isEntryHostUrl(pageUrl)) {
+                rememberForumUrl(pageUrl)
+                endForumEntry(true)
+            }
+            return
+        }
+
+        // 是发布页：把它自己记进「发布页域名」，避免被当成论坛主站
+        onLandingPage = true
+        pageHost?.let { Prefs.addEntryHost(this, it) }
+        DebugLog.log("ENTRY", "识别到发布页 ${pageUrl}，目标=$target")
+
+        if (target.isBlank()) { scheduleNextProbe(pageUrl); return }
+
+        val targetHost = hostOf(target)
+        // 目标是发布页自己 / 社交链接 / 解析不出来：不跳，稍后重探（防止原地打转）
+        if (targetHost == null || isSocialUrl(target) || targetHost == pageHost ||
+            targetHost == "example.com" || targetHost.endsWith(".example.com")
+        ) {
+            scheduleNextProbe(pageUrl); return
+        }
+
+        // 先登记目标域名（写盘后再跳），否则跳过去那一下会被「站外链接拦截」掐死
+        registerTrustedHost(targetHost)
+        DebugLog.log("ENTRY", "直达最新地址: $target")
+        autoJumpAttempt = 0
+        // 用 JS 跳转（而非 loadUrl）保留 Referer，避免论坛侧风控把它当成直接访问
+        val js = "try{window.__dzAutoJumped=1;location.href=" +
+            org.json.JSONObject.quote(target) + ";}catch(e){}"
+        webView.evaluateJavascript(js, null)
+    }
+
+    /** 未命中目标链接：页面可能刚跳空白/链接晚注入，短暂再探，最多 4 次（约 2.5s） */
+    private fun scheduleNextProbe(pageUrl: String?) {
+        if (!(entryMode || isEntryHostUrl(pageUrl))) return
+        if (autoJumpAttempt >= 4) return
+        webView.postDelayed(autoJumpPoll, 600L)
+    }
+
+    /**
+     * 解开 evaluateJavascript 回传值的外层 JSON 编码，拿回 JS 实际返回的字符串。
+     * 例：`"{\"url\":\"http:\/\/a\",\"target\":\"https:\/\/b\"}"` → `{"url":...}`
+     */
+    private fun decodeJsResult(res: String?): String {
+        if (res.isNullOrBlank()) return ""
+        return try {
+            when (val v = org.json.JSONTokener(res).nextValue()) {
+                is String -> v
+                else -> res
+            }
+        } catch (_: Exception) {
+            res.trim().removePrefix("\"").removeSuffix("\"")
+        }
+    }
+
+    /** 兜底：从被转义过的回传原文里按 `\"field\":\"值\"` 抠出字段 */
+    private fun extractEscapedField(raw: String?, field: String): String? {
+        if (raw.isNullOrBlank()) return null
+        val pat = "\\\\?\"" + java.util.regex.Pattern.quote(field) +
+            "\\\\?\"\\s*:\\s*\\\\?\"((?:[^\"\\\\]|\\\\.)*?)\\\\?\""
+        return try {
+            Regex(pat).find(raw)?.groupValues?.get(1)?.replace("\\/", "/")?.takeIf { it.isNotBlank() }
+        } catch (_: Exception) { null }
+    }
+
+    /** 打开首页（同 [loadHome]） */
     private fun goHome() {
         loadHome()
     }
@@ -2376,13 +2636,51 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 当前论坛的可信域名（含其子域）。取自设置里配置的网址。 */
+    /** 取 URL 的主机名（小写，无端口） */
+    private fun hostOf(url: String?): String? {
+        if (url.isNullOrBlank()) return null
+        if (!url.startsWith("http://") && !url.startsWith("https://")) return null
+        return try { Uri.parse(url).host?.lowercase()?.trim()?.takeIf { it.isNotBlank() } } catch (e: Exception) { null }
+    }
+
+    /** 取 host 的「根域名」粗判用：xxx.sxsy33.com → sxsy33.com */
+    private fun matchesHost(host: String, base: String): Boolean =
+        host == base || host.endsWith(".$base")
+
+    /**
+     * 论坛本体域名：设置里配置的网址 + 运行期从发布页跳转命中过的域名。
+     * 不含发布页域名（发布页不是论坛，不该被当成「主站」）。
+     */
+    private fun forumHosts(): List<String> {
+        val out = LinkedHashSet<String>()
+        hostOf(Prefs.getHomeUrl(this))?.let { out.add(it) }
+        out.addAll(Prefs.getTrustedHosts(this))
+        out.removeAll(Prefs.getEntryHosts(this).toSet())
+        return out.toList()
+    }
+
+    /** 该 URL 是否属于发布页（「最新地址」导航页）域名 */
+    private fun isEntryHostUrl(url: String?): Boolean {
+        val h = hostOf(url) ?: return false
+        return Prefs.getEntryHosts(this).any { matchesHost(h, it) }
+    }
+
+    /** 该 host 是否是已知的论坛域名 */
+    private fun isForumHost(host: String?): Boolean {
+        if (host.isNullOrBlank()) return false
+        return forumHosts().any { matchesHost(host, it) }
+    }
+
+    /**
+     * 当前论坛的可信域名（含其子域）：配置的网址 + 发布页跳转命中过的域名 + 发布页域名本身。
+     * 发布页也要放行，否则「入口页 → 最新地址」这一步会被自己的站外拦截掐死。
+     */
     private fun trustedHosts(): List<String> {
-        val base = try {
-            Uri.parse(Prefs.getHomeUrl(this)).host?.lowercase()?.trim()
-        } catch (e: Exception) { null }
-        if (base.isNullOrBlank()) return emptyList()
-        return listOf(base)
+        val out = LinkedHashSet<String>()
+        hostOf(Prefs.getHomeUrl(this))?.let { out.add(it) }
+        out.addAll(Prefs.getTrustedHosts(this))
+        out.addAll(Prefs.getEntryHosts(this))
+        return out.toList()
     }
 
     /** JS 桥调用白名单：相对路径放行（来自论坛页面，后续用论坛 referer 补全）；
@@ -2406,12 +2704,51 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 拦截外部站点导航：命中则提示并 return true（不在 WebView / 系统浏览器打开） */
+    /**
+     * 拦截外部站点导航：命中则提示并 return true（不在 WebView 打开）。
+     *
+     * 例外（2026-10 站点改版后的关键修复）：
+     *  停留在「最新地址」发布页时，页面上的「进入」按钮指向当前论坛域名（如 sxsy33.com），
+     *  这是**进论坛的唯一通路**。旧逻辑把它当站外链接一律拦掉，用户点了毫无反应 ——
+     *  表现就是「网站更新后 App 用不了了」。现在：发布页上点到的非社交类链接，
+     *  一律先登记为可信论坛域名再放行，并顺手写回设置。
+     */
     private fun interceptExternalNav(url: String): Boolean {
         if (!isExternalNavUrl(url)) return false
+        val landing = onLandingPage || isEntryHostUrl(webView.url ?: lastLoadedUrl)
+        if (landing) {
+            // 发布页上的 Telegram / 邮箱等社交入口：交给系统浏览器，别在 WebView 里开
+            if (isSocialUrl(url)) {
+                DebugLog.log("NAV", "发布页社交链接转系统浏览器: $url")
+                try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) } catch (_: Exception) {}
+                return true
+            }
+            // 其余一律视为「进入论坛」：先登记域名 → 再放行，站外拦截才不会二次掐死
+            val h = hostOf(url)
+            if (h != null) {
+                DebugLog.log("NAV", "发布页点击进入论坛，登记域名: $h")
+                registerTrustedHost(h)
+            }
+            return false
+        }
         DebugLog.log("NAV", "拦截外部站点: $url")
         Toast.makeText(this, "已拦截外部链接", Toast.LENGTH_SHORT).show()
         return true
+    }
+
+    /** 社交/联系类链接（不可能是论坛本体） */
+    private fun isSocialUrl(url: String): Boolean {
+        val h = hostOf(url) ?: return false
+        return listOf("t.me", "telegram.me", "telegram.org", "twitter.com", "x.com",
+            "facebook.com", "discord.gg", "discord.com", "wa.me", "whatsapp.com")
+            .any { h == it || h.endsWith(".$it") }
+    }
+
+    /** 把 host 记为可信论坛域名（内存白名单靠读 Prefs，所以只需落盘） */
+    private fun registerTrustedHost(host: String) {
+        val h = host.trim().lowercase()
+        if (h.isBlank()) return
+        Prefs.addTrustedHost(this, h)
     }
 
     /**
@@ -2509,6 +2846,13 @@ class MainActivity : AppCompatActivity() {
                 true
             }
             R.id.action_home -> { goHome(); true }
+            // 手动重新取一次最新地址：论坛换域名后不用等 App 更新，也不用去设置里改网址
+            R.id.action_latest -> {
+                fallbackToEntryTried = true
+                beginForumEntry()
+                Toast.makeText(this, "正在获取最新地址…", Toast.LENGTH_SHORT).show()
+                true
+            }
             R.id.action_downloads -> {
                 startActivity(Intent(this, DownloadsActivity::class.java))
                 true

@@ -7,8 +7,25 @@ import android.content.SharedPreferences
  * 配置持久化：论坛网址 + 下载目录 + 桌面模式开关
  */
 object Prefs {
-    /** 论坛默认网址（首次进入设置页时预填，用户确认后保存） */
-    const val DEFAULT_FORUM_URL = "https://sxsy45.com"
+    /**
+     * 论坛默认网址（首次进入设置页时预填，用户确认后保存）。
+     *
+     * 站点换域名后这个值可能马上过期，真正决定「进哪」的是 [ENTRY_URL] 发布页
+     * 里「最新地址」指向的域名（运行期自动发现并写回本项）。
+     */
+    const val DEFAULT_FORUM_URL = "https://sxsy33.com"
+
+    /**
+     * 发布页入口（固定不动的入口地址）。
+     *
+     * 站点现在把老域名 301 到这个「最新地址」导航页：页面上给出当前论坛域名，
+     * 需要点「进入」才进得去论坛。论坛域名轮换时这个入口依然有效，
+     * 所以 App 用「入口页 → 最新地址 → 论坛」这条链路自愈，不写死论坛域名。
+     */
+    const val ENTRY_URL = "https://sxsy45.com"
+
+    /** 已知的发布页域名（进入论坛链路上的中间页，不是论坛本体） */
+    private val SEED_ENTRY_HOSTS = listOf("sxsy45.com", "sxsy.pw")
 
     private const val NAME = "sxsy_reader_prefs"
 
@@ -26,6 +43,10 @@ object Prefs {
     private const val KEY_READER_LINE_SPACING = "reader_line_spacing"
     /** 自动购买时单次售价上限（超过此价格的附件不买，留给用户手动确认） */
     private const val KEY_AUTO_PAY_MAX = "auto_pay_max_price"
+    /** 可信论坛域名（发布页跳转命中过的真实论坛域名，论坛换域名后仍需认得） */
+    private const val KEY_TRUSTED_HOSTS = "trusted_hosts"
+    /** 发布页域名（跳转链路上的中间页，与论坛本体区分开） */
+    private const val KEY_ENTRY_HOSTS = "entry_hosts"
 
     private fun sp(ctx: Context): SharedPreferences =
         ctx.getSharedPreferences(NAME, Context.MODE_PRIVATE)
@@ -33,6 +54,38 @@ object Prefs {
     fun getUrl(ctx: Context): String = sp(ctx).getString(KEY_URL, "") ?: ""
 
     fun setUrl(ctx: Context, url: String) = sp(ctx).edit().putString(KEY_URL, url.trim()).apply()
+
+    /**
+     * 可信论坛域名集合：记录「曾经作为论坛主站进入过」的主机名。
+     *
+     * 论坛是动态域名（如 sxsy33.com，随发布页轮换），只有运行期跳转命中后才知道；
+     * 必须持久化记下来，否则「站外链接转系统浏览器」的拦截会把它当外站踢出去，
+     * 表现就是点了「进入」毫无反应、冷启动永远进不了论坛。
+     */
+    fun getTrustedHosts(ctx: Context): Set<String> =
+        sp(ctx).getStringSet(KEY_TRUSTED_HOSTS, emptySet())?.toSet() ?: emptySet()
+
+    fun addTrustedHost(ctx: Context, host: String) {
+        val h = host.trim().lowercase()
+        if (h.isBlank()) return
+        val cur = getTrustedHosts(ctx).toMutableSet()
+        if (cur.add(h)) sp(ctx).edit().putStringSet(KEY_TRUSTED_HOSTS, cur).apply()
+    }
+
+    fun clearTrustedHosts(ctx: Context) = sp(ctx).edit().remove(KEY_TRUSTED_HOSTS).apply()
+
+    /** 已知发布页域名（含运行期从页面结构里认出来的新发布页） */
+    fun getEntryHosts(ctx: Context): Set<String> =
+        (sp(ctx).getStringSet(KEY_ENTRY_HOSTS, emptySet())?.toSet() ?: emptySet()) +
+            SEED_ENTRY_HOSTS
+
+    fun addEntryHost(ctx: Context, host: String) {
+        val h = host.trim().lowercase()
+        if (h.isBlank()) return
+        val cur = (sp(ctx).getStringSet(KEY_ENTRY_HOSTS, emptySet())?.toSet()
+            ?: emptySet()).toMutableSet()
+        if (cur.add(h)) sp(ctx).edit().putStringSet(KEY_ENTRY_HOSTS, cur).apply()
+    }
 
     /** 实际首页：设置里配置的网址为空时回落到论坛默认首页 */
     fun getHomeUrl(ctx: Context): String = getUrl(ctx).ifBlank { DEFAULT_FORUM_URL }

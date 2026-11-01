@@ -14,6 +14,10 @@
         android:title="返回首页"
         app:showAsAction="never" />
     <item
+        android:id="@+id/action_latest"
+        android:title="获取最新地址"
+        app:showAsAction="never" />
+    <item
         android:id="@+id/action_downloads"
         android:title="下载文件"
         app:showAsAction="never" />

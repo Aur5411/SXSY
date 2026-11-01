@@ -48,7 +48,8 @@ class SettingsActivity : AppCompatActivity() {
         tvRetention = findViewById(R.id.tvRetention)
 
         // 回填当前配置（首次未配置时预填默认网址，用户确认后可保存）
-        etUrl.setText(Prefs.getUrl(this).ifBlank { Prefs.DEFAULT_FORUM_URL })
+        // 不预填默认域名：留空表示「每次启动自动取最新地址」，避免用户一点保存就把域名钉死
+        etUrl.setText(Prefs.getUrl(this))
         Prefs.setDesktopMode(this, true)
         etDownloadDir.setText(Prefs.getDownloadDir(this))
         etCustomJs.setText(Prefs.getCustomJs(this))
@@ -223,19 +224,27 @@ class SettingsActivity : AppCompatActivity() {
     }
 
     private fun save() {
-        // 网址留空则回落到默认首页，保证返回主界面时 onResume 一定能加载
+        // 网址留空 = 不锁定域名：每次启动从发布页自动获取「最新地址」再进论坛
         val raw = etUrl.text.toString().trim()
-        Prefs.setUrl(this, raw.ifBlank { Prefs.DEFAULT_FORUM_URL })
+        Prefs.setUrl(this, raw)
+        if (raw.isNotBlank()) {
+            // 用户手工填的域名最权威：清掉自动发现的旧记录，只留这一个
+            Prefs.clearTrustedHosts(this)
+            try {
+                Uri.parse(Prefs.normalizeUrl(raw)).host?.lowercase()?.takeIf { it.isNotBlank() }
+                    ?.let { Prefs.addTrustedHost(this, it) }
+            } catch (e: Exception) { /* 忽略 */ }
+        }
         Prefs.setDesktopMode(this, true)
         Prefs.setDownloadDir(this, etDownloadDir.text.toString().trim().ifBlank { "尚香书院" })
         Prefs.setCustomJs(this, etCustomJs.text.toString())
         Prefs.setAdBlock(this, true)
-        Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, if (raw.isBlank()) "已保存（启动时自动获取最新地址）" else "已保存", Toast.LENGTH_SHORT).show()
         finish()
     }
 
     private fun reset() {
-        etUrl.setText(Prefs.DEFAULT_FORUM_URL)
+        etUrl.setText("")   // 恢复默认 = 不锁定域名，启动时自动取最新地址
         Prefs.setDesktopMode(this, true)
         etDownloadDir.setText("尚香书院")
         etCustomJs.setText("")
