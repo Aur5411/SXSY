@@ -130,7 +130,7 @@ object DownloadHelper {
             var cleaned = (if (needsRepair) fixEncoding(raw) else raw)
                 .replace(Regex("[\\\\/:*?\"<>|\\uFFFD]"), "_")
                 .trim()
-            cleaned = stripSiteWatermark(cleaned)
+            cleaned = stripDomainWatermark(stripSiteWatermark(cleaned))
             if (cleaned.isNotBlank() && !looksLikeScriptOrGenericPage(cleaned)) {
                 return cleaned
             }
@@ -175,7 +175,8 @@ object DownloadHelper {
         }
 
         var result = fixEncoding(name!!)
-        result = stripWebsite(result)
+        // URL/响应头兜底路径同样要剥水印：新版站点会把域名塞进 Content-Disposition
+        result = stripDomainWatermark(stripSiteWatermark(stripWebsite(result)))
 
         // 清理文件名非法字符与无效乱码
         result = result.replace(Regex("[\\\\/:*?\"<>|\\uFFFD]"), "_")
@@ -434,6 +435,97 @@ object DownloadHelper {
 
     // 注：原先还有 bookTitleOf()（从帖子标题用《》取书名、用「数字-数字」取章节）作为命名兜底，
     // 已按需求删除 —— **只用附件原来的名字**，拿不到就交给响应头 / URL 兜底。
+
+    /**
+     * 通用站点水印（**不限域名**）：新版站点在附件名前面又加了新的域名
+     * （`sxsy.org` / `soushu2025.com` 之外的），例如
+     * `[www.sxsy33.com]书名.txt`、`xxx.com@书名.txt`、`https://xxx.com/书名.txt`。
+     *
+     * [stripSiteWatermark] 只能命中写死的几个域名，新域名一换就漏；这里按**域名形态**识别：
+     * 只要求「开头是域名」（可带协议、方括号/书名号包裹、后跟 @ 或分隔符），
+     * 或文件名中间嵌着域名，就一律去掉。没有域名形态则**原样返回**，
+     * 因此 `【书名】（加料版）.txt` 这种带装饰括号的正常名字不会被误改。
+     */
+    fun stripDomainWatermark(name: String): String {
+        if (name.isBlank()) return name
+        val dot = name.lastIndexOf('.')
+        val base = if (dot > 0) name.substring(0, dot) else name
+        val ext = if (dot > 0) name.substring(dot) else ""
+        val re = Regex("(?i)$DOMAIN_BODY")
+        if (!re.containsMatchIn(base)) return name
+
+        var b = base
+        // 整条 URL 形态（`https://host/path/书名.txt`）：直接取**最后一个路径段**当文件名，
+        // 否则域名后面的路径会被一起当成分隔符吃掉，名字就空了。
+        if (!b.contains(' ') && Regex("(?i)^\\s*https?://").containsMatchIn(b)) {
+            val segment = b.substringAfter("://", "").trim('/').substringAfterLast('/')
+            if (segment.isNotBlank()) b = segment
+        }
+        // 反复剥「开头就是域名」的段（有的名字叠了两三个标记，如 `[a.com]b.com@书名`）
+        var prev = ""
+        var guard = 0
+        while (b != prev && guard++ < 8) {
+            prev = b
+            b = b.replace(
+                Regex(
+                    "(?i)^[\\s\\[【（(]*" + "(?:https?://)?" + DOMAIN_BODY +
+                        "(?:/[^\\s\\[\\]【】（）()]*)?(?:/[^\\s\\[\\]【】（）()]*)*" +
+                        "[\\s\\]】）)]*[@\\s:：_\\-—·.、,，]*"
+                ),
+                ""
+            )
+        }
+        // 中间嵌着的域名 → 空格
+        b = b.replace(Regex("(?i)$DOMAIN_BODY"), " ")
+        // 收拾分隔符与空括号（有内容的括号，如（加料版），必须留着）
+        prev = ""
+        while (prev != b) {
+            prev = b
+            b = b.replace(Regex("[\\[\\]【】（）()]\\s*[\\[\\]【】（）()]"), "")
+        }
+        b = b.replace("@", " ")
+            .replace(Regex("[\\s:：_\\-—·、,，]{2,}"), " ")
+            .replace(Regex("([:：/])\\s+"), "$1")
+            .replace(Regex("\\s+"), " ")
+            .replace(Regex("\\s+(\\.[A-Za-z0-9]{1,8})$"), "$1")
+            .trim(' ', '-', '_', '.', ',', '，', ':', '：', '@')
+        if (b.isBlank()) return "download" + ext
+        return b + ext
+    }
+
+    /**
+     * 域名本体（用于通用水印识别）：`(www.)主机(.子域)*.TLD`。
+     * TLD 只列站群实际会用到的，避免把 `书名 1-12` 这类纯数字点号误判成域名。
+     */
+    private const val DOMAIN_BODY =
+        "(?:www\\.)?[a-z0-9][a-z0-9-]{0,62}(?:\\.[a-z0-9][a-z0-9-]{0,62})*" +
+            "\\.(?:com|net|org|cn|cc|vip|xyz|top|site|me|info|io|co|tv|la|in|pw|fun|icu|" +
+            "us|biz|club|online|shop|app|dev|link|win|work|live|space|store|tech|art|" +
+            "wang|xin|ren|asia|mobi|pro|plus|ink|run|life|world|today|press|host|click)"
+
+    /** 合理的文件扩展名形态（保留原后缀用） */
+    private val PLAUSIBLE_EXT = Regex("^\\.[A-Za-z0-9]{1,8}$")
+
+    /** 按扩展名给 MIME（魔数认不出类型时用，保证 MediaStore 里的类型与后缀一致） */
+    fun mimeForExt(ext: String): String = when (ext.lowercase().let { if (it.startsWith(".")) it else ".$it" }) {
+        ".txt" -> "text/plain"
+        ".epub" -> "application/epub+zip"
+        ".pdf" -> "application/pdf"
+        ".zip" -> "application/zip"
+        ".rar" -> "application/x-rar-compressed"
+        ".7z" -> "application/x-7z-compressed"
+        ".gz" -> "application/gzip"
+        ".mobi" -> "application/x-mobipocket-ebook"
+        ".azw3", ".azw" -> "application/vnd.amazon.ebook"
+        ".chm" -> "application/vnd.ms-htmlhelp"
+        ".html", ".htm" -> "text/html"
+        ".jpg", ".jpeg" -> "image/jpeg"
+        ".png" -> "image/png"
+        ".gif" -> "image/gif"
+        ".webp" -> "image/webp"
+        ".bmp" -> "image/bmp"
+        else -> ""
+    }
 
     /** 按 MIME 猜扩展名（公开：浏览器通道保存时也用） */
     fun guessExt(mimeType: String?): String {
@@ -740,13 +832,22 @@ object DownloadHelper {
         if (size > MAX_DOWNLOAD_BYTES) {
             throw IOException("下载文件超过 ${MAX_DOWNLOAD_BYTES / (1024L * 1024L)} MB 限制")
         }
-        // 用文件真实内容（魔数）识别类型，据此补/校正扩展名与 MIME，而非只靠文件名猜
+        // 用文件真实内容（魔数）识别类型：只在**名字本身没有后缀**时用来补后缀
         val fileType = detectFileType(source)
         var finalName = normalizeSavedFileName(fileName, fileType, preserveName)
         if (Build.VERSION.SDK_INT >= 29) {
             finalName = ensureUniqueNameMediaStore(ctx, finalName)
         }
-        val finalMime = fileType.mime
+        // MIME 必须跟着**最终文件名后缀**走：否则系统下载目录里会出现
+        // 「.txt 文件被登记成 application/octet-stream」「.epub 被登记成 application/zip」
+        // 这类不一致（部分文件管理器据此打不开文件）。
+        val ext = finalName.substringAfterLast('.', "")
+        val mimeByExt = if (ext.isEmpty()) "" else mimeForExt(ext)
+        val finalMime = when {
+            mimeByExt.isNotEmpty() -> mimeByExt
+            fileType.mime != "application/octet-stream" -> fileType.mime
+            else -> "application/octet-stream"
+        }
         if (Build.VERSION.SDK_INT >= 29) {
             saveViaMediaStore(ctx, source, finalName, finalMime)
         } else {
@@ -1033,54 +1134,41 @@ object DownloadHelper {
         ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"
     )
 
-    private fun normalizeSavedFileName(fileName: String, fileType: FileType, preserveName: Boolean = false): String {
-        // 一律去掉站点标记（sxsy.org / sxsy45.com 等）：不管名字来自帖子标题、附件名还是响应头
-        val nameIn = stripSiteWatermark(fileName)
-        // preserveName：名字来自帖子标题（书名号内）或帖子内 attachname —— **原样保留**。
-        // 不剥站点标记（stripWebsite 会把书名自带的【】剥掉）、不做多编码猜测（会把正常中文解码坏），
-        // 只在帖子里的名字**确实缺扩展名**时，按文件真实类型补一个后缀，主体一字不改。
-        if (preserveName) {
-            val safe = nameIn
-                .replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001F\\uFFFD]"), "_")
-                .trim()
-            if (safe.isNotBlank()) {
-                val dotIdx = safe.lastIndexOf('.')
-                val hasExt = dotIdx > 0 && safe.substring(dotIdx).lowercase() in PRESERVE_KNOWN_EXTS
-                if (hasExt || fileType.ext.isEmpty()) return safe
-                return safe + fileType.ext
-            }
-        }
-
-        // 不做乱码修复/重命名：站点返回的文件名本身不乱码。
-        // 只做两件事：清理非法字符、去掉文件名前面的站点标记。
-        // 注意 stripWebsite 必须在「含扩展名的完整名」上调用——它靠最后一个点拆 base/ext，
-        // 若先拆掉扩展名再传进去，站点域名里的点会被当成扩展名分隔点，前缀就剥不掉了。
-        var safe = nameIn
+    private fun normalizeSavedFileName(
+        fileName: String,
+        fileType: FileType,
+        @Suppress("UNUSED_PARAMETER") preserveName: Boolean = false
+    ): String {
+        // 一律去掉站点标记：先去掉已知域名（sxsy.org / sxsy45.com …），
+        // 再按**域名形态**去掉任何新加的水印域名（sxsy33.com / xxx.com@ / 带协议前缀的）。
+        val nameIn = stripDomainWatermark(stripSiteWatermark(fileName))
+        val safe = nameIn
             .replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001F\\uFFFD]"), "_")
             .trim()
-        val stripped = stripWebsite(safe)
-        if (stripped.isNotBlank()) safe = stripped.trim()
+        if (safe.isBlank()) {
+            return "download_" + System.currentTimeMillis() + (fileType.ext.ifEmpty { ".txt" })
+        }
 
-        // 保留原始扩展名（.epub/.pdf/.txt/.zip/.rar 等），仅当无合理扩展名时才用魔数识别的真实扩展名兜底
-        val knownExts = setOf(
-            ".txt", ".zip", ".epub", ".pdf", ".rar", ".7z", ".gz",
-            ".mobi", ".azw3", ".azw", ".chm", ".umd", ".html", ".htm"
-        )
+        // ★ 原后缀优先：只要名字末尾是「像扩展名」的短串（2~8 位字母数字，且不全是数字，
+        //   避免 `书名 1-12.5` 这种被当成 `.5`），就**原样保留**，不再被魔数结果或 .txt 覆盖。
+        //   只有确实没有扩展名时，才用魔数识别的真实类型补一个，最后才退到 .txt。
         val dotIdx = safe.lastIndexOf('.')
-        val rawExt = if (dotIdx >= 0) safe.substring(dotIdx).lowercase() else ""
+        val rawExt = if (dotIdx > 0) safe.substring(dotIdx) else ""
+        val keepExt = rawExt.isNotEmpty() &&
+            PLAUSIBLE_EXT.matches(rawExt) &&
+            rawExt.length >= 2 &&
+            !rawExt.drop(1).all { it.isDigit() }
+
         val baseName: String
         val ext: String
-        if (dotIdx >= 0 && rawExt in knownExts) {
-            // 已有合理扩展名，优先保留原始扩展名
+        if (keepExt) {
             baseName = safe.substring(0, dotIdx).trim()
-            ext = safe.substring(dotIdx)
+            ext = rawExt
         } else if (fileType.ext.isNotEmpty()) {
-            // 无扩展名时用魔数识别的真实类型补后缀
             baseName = safe.trim()
             ext = fileType.ext
         } else {
-            // 兜底：按文本处理
-            baseName = safe.substringBeforeLast('.', safe).trim()
+            baseName = safe.trim()
             ext = ".txt"
         }
         if (baseName.isBlank()) {

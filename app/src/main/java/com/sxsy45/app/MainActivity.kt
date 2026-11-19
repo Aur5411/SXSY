@@ -65,7 +65,6 @@ import java.io.ByteArrayInputStream
  *  - injectAdBlock()      弹窗广告屏蔽（popadv 插件 + Discuz fwin_ 广告浮层兜底）
  *  - injectAttachNameJs() 读取帖子内附件真实文件名并上报，用于下载时保留原名
  *  - injectForumCleanup() 摘掉外链推广分区 + 残留广告节点（规则见 AdBlocker.kt）
- *  - injectAutoSign()     每日签到自动完成
  *  - injectAttachPayHook() 付费附件自动购买/下载挂钩
  *  - injectCustomJs()     设置页「自定义脚本（JS）」——最后注入，跑在内置脚本之后
  * 广告资源另在 shouldInterceptRequest 层直接拦掉（popadv.js 换成空实现）。
@@ -321,7 +320,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         // 暂停本 WebView 的 JS 定时器与渲染：点开帖子会新开一个界面承载帖子页，
-        // 本界面（版面列表）转入后台。若不暂停，它注入的广告监听/自动购买轮询/自动签到
+        // 本界面（版面列表）转入后台。若不暂停，它注入的广告监听/自动购买轮询
         // 会继续在后台跑，与新界面的 WebView 抢主线程和 CPU —— 这是「打开帖子慢」的主因之一。
         // 注意：这里只用实例方法 onPause()，不能用进程级的 WebView.pauseTimers()——
         // 后者会把刚新开的帖子页 WebView 的定时器一起冻结。
@@ -384,7 +383,6 @@ class MainActivity : AppCompatActivity() {
                 injectAttachNameJs()
                 injectAttachmentClickHook()
                 injectForumCleanup()
-                injectAutoSign()
                 injectAttachPayHook()
                 tryAutoPay()
                 injectCustomJs()   // 用户自定义脚本最后注入（在内置脚本之后）
@@ -1370,147 +1368,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 「每日签到」自动完成（k_misign 插件，带算术验证）。
-     *
-     * 流程：点签到入口（顶部 #k_misign_topb 图标 / 完整签到页 .J_chkitot）→ ajaxget
-     * 请求 operation=qiandao，服务器若开启算术验证会返回一段含 prompt("X+Y=?") 的脚本。
-     * 这里包装 window.prompt：当提示文本里能提取出「数字 运算符 数字」算式时，
-     * 自动算出答案返回（不弹真实输入框），签到流程据此自动完成。
-     *
-     * 触发：任意页面加载后，检测到签到入口且今天未签到时自动点击（全局包装 prompt，
-     * 因为首页顶部入口触发算术题也走 prompt）。用 localStorage 记录「当天已签到」避免重复点。
-     */
-    private fun injectAutoSign() {
-        val js = """
-(function(){
-  if(window.__dzAutoSign) return; window.__dzAutoSign=1;
-
-  // 从提示文本提取算式并计算（支持 + - × x * ÷ /，数字可多位）
-  function calcAnswer(msg){
-    var m = String(msg||'').replace(/[=\?？\s]/g,'').match(/(\d+)([+\-xX×*÷\/])(\d+)/);
-    if(!m) return null;
-    var a = parseInt(m[1],10), b = parseInt(m[3],10), op = m[2], r;
-    if(op==='+') r = a + b;
-    else if(op==='-') r = a - b;
-    else if(op==='x'||op==='X'||op==='×'||op==='*') r = a * b;
-    else if(op==='÷'||op==='/') r = (b===0 ? 0 : a / b);
-    else return null;
-    return String(r);
-  }
-
-  // 全局包装 prompt：算术验证时自动算答案（首页/签到页都生效）
-  try{
-    var _origPrompt = window.prompt;
-    window.prompt = function(msg, def){
-      try{
-        var ans = calcAnswer(msg);
-        if(ans !== null){
-          if(window.DiscuzApp) window.DiscuzApp.signNotice('签到验证已自动计算：'+msg+' = '+ans);
-          return ans;
-        }
-      }catch(e){}
-      return (typeof _origPrompt==='function') ? _origPrompt.apply(this, arguments) : null;
-    };
-  }catch(e){}
-
-  // 是否「今天已签到」：优先看 DOM（最可信），localStorage 只作辅助。
-  //
-  // ⚠ localStorage 的 key 从 sign_ 换成 sign2_：旧版本点完入口就**乐观写入** sign_，
-  //   根本不管服务器是否真签上。结果一旦那次点击没成功（比如首页入口压根没找到、
-  //   或者弹层还需要二次确认），当天就再也不会重试，表现就是「签不了」。
-  //   换 key 让历史脏标记立即失效。
-  function todayKey(){
-    var d=new Date();
-    return 'sign2_' + d.getFullYear() + '-' + (d.getMonth()+1) + '-' + d.getDate();
-  }
-  function markSigned(){ try{ localStorage.setItem(todayKey(), '1'); }catch(e){} }
-  function isSignedToday(){ try{ return localStorage.getItem(todayKey())==='1'; }catch(e){ return false; } }
-
-  // DOM 上的「已签到」判据：头像图标 alt 会被 k_misign 写成「今日已签」；
-  // 兜底再看顶部入口的可见文字。
-  function isSignedInDom(){
-    try{
-      var img=document.getElementById('fx_checkin_b');
-      if(img){
-        var alt=img.getAttribute('alt')||'';
-        if(/已签/.test(alt)) return true;
-      }
-      var top=document.getElementById('k_misign_topb');
-      if(top && /已签/.test(top.textContent||'')) return true;
-      if(document.querySelector('.k_misign_signed,.k_signed')) return true;
-    }catch(e){}
-    return false;
-  }
-
-  // 找签到入口。
-  //
-  // 实测首页真实结构（k_misign 插件）：
-  //   <a href="https://host/plugin.php?id=k_misign:sign" id="k_misign_topb" onmouseover="showMenu(…)">
-  //     <img id="fx_checkin_b" src="…/mini2.gif" alt="今日已签">
-  //   </a>
-  // ——`#k_misign_topb` **自己就是那个 <a>**，里面只有一个 <img>。
-  // 旧实现是在它**内部**找 `a[href*="operation=qiandao"]`，另一条兜底又要求 href 含
-  // `qiandao`，而真实 href 是 `plugin.php?id=k_misign:sign`，两条都不匹配
-  // → 首页入口永远找不到 → 重试 30 次后放弃，这就是「主页不能正常签到」。
-  function findEntry(){
-    // ① 完整签到页的按钮
-    var a = document.querySelector('a.J_chkitot') || document.querySelector('.J_chkitot');
-    if(a) return a;
-    // ② 首页顶部图标：元素自身就是 <a> 时直接用它
-    var top = document.getElementById('k_misign_topb');
-    if(top){
-      if(String(top.tagName).toUpperCase()==='A') return top;
-      var inner = top.querySelector('a');
-      if(inner) return inner;
-    }
-    // ③ 图标本身 → 最近的 <a>（不再要求 href 含 qiandao）
-    var img = document.getElementById('fx_checkin_b');
-    if(img){ var p = img.closest('a'); if(p) return p; }
-    // ④ 兜底：任何指向 k_misign / qiandao 的链接
-    return document.querySelector(
-      'a[href*="id=k_misign"],a[href*="qiandao"],a[onclick*="misign"],a[onclick*="qiandao"]');
-  }
-
-  // 入口可能点开的是 fwin 弹层：层里的「签到」按钮要再点一次
-  function confirmLayer(){
-    try{
-      var btn=document.querySelector(
-        '#fwin_misign a[href*="id=k_misign:sign"], #fwin_misign a[href*="qiandao"],' +
-        '#fwin_qiandao a[href*="qiandao"], #fwin_misign button[type="submit"],' +
-        '#fwin_qiandao button[type="submit"], #fwin_misign .k_misign_btn, #fwin_qiandao .k_misign_btn');
-      if(btn){
-        if(window.DiscuzApp) window.DiscuzApp.signNotice('自动签到：已点弹层确认');
-        try{ btn.click(); }catch(e){}
-      }
-    }catch(e){}
-  }
-
-  // 自动点击签到入口
-  var tries = 0, attempted = false;
-  function clickSign(){
-    if(attempted) return;
-    if(isSignedInDom()){ markSigned(); return; }   // DOM 已显示「已签」→ 只记录，不再点
-    if(isSignedToday()) return;                    // 今天确实签成功过
-    var a = findEntry();
-    if(a){
-      attempted = true;                            // 只在本次页面内防重复，不再「一点就锁死一天」
-      if(window.DiscuzApp) window.DiscuzApp.signNotice('自动签到：已触发签到');
-      try{ a.click(); }catch(e){}
-      // 弹层二次确认 + 结果核对：只有 DOM 真的变成「已签」才写 localStorage
-      setTimeout(confirmLayer, 700);
-      setTimeout(function(){ if(isSignedInDom()) markSigned(); }, 2600);
-      return;
-    }
-    if(tries++ < 30){ setTimeout(clickSign, 500); }
-    else if(window.DiscuzApp) window.DiscuzApp.signNotice('自动签到：未找到签到入口（可到签到页手动签）');
-  }
-  setTimeout(clickSign, 1500);
-})();
-""".trimIndent()
-        webView.evaluateJavascript(js, null)
-    }
-
-    /**
      * 付费附件点击拦截：站点的 showWindow('attachpay') 弹窗在本 WebView 失效且会
      * 阻止默认导航，导致 shouldOverrideUrlLoading 收不到 attachpay 请求。故在 JS 层
      * 捕获阶段拦截 attachpay 链接点击，preventDefault 后经桥交原生完成购买+下载。
@@ -2044,11 +1901,11 @@ class MainActivity : AppCompatActivity() {
             AdBlocker.rememberForumName(fid, name)
         }
 
-        /** 自动签到结果提示 */
+        /** 页面提示：注入脚本（附件未找到下载链接等）向用户弹一条 Toast */
         @JavascriptInterface
         fun signNotice(msg: String?) {
             if (msg.isNullOrBlank()) return
-            DebugLog.log("SIGN", msg)
+            DebugLog.log("PAGE", msg)
             runOnUiThread {
                 Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show()
             }
@@ -2831,6 +2688,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onPrepareOptionsMenu(menu: Menu?): Boolean {
+        // 诊断日志菜单只在设置里开了「显示诊断菜单」时才露出（默认隐藏，零开销）
         menu?.findItem(R.id.action_debug)?.isVisible = DebugLog.isEnabled()
         return super.onPrepareOptionsMenu(menu)
     }
